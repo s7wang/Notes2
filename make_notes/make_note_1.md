@@ -1868,7 +1868,7 @@ This is bar().
 ~~~
 
 * 所有 .o 文件默认使用 -O;
-* 对 foo.o 强制使用 -g（即调试模式），覆盖系统/命令行变量
+* 对 foo.o 强制使用 -g（即调试模式），覆盖系统/命令行变量。
 
 可以看到编译提示均符合预期。
 
@@ -1876,11 +1876,805 @@ This is bar().
 
 ## 5 Makefile 中使用条件判断
 
+使用条件判断，可以让make根据运行时的不同情况选择不同的执行分支。条件表达式可以是比较变量的值，或是变量和常量的值。
 
+### 5.1 条件判断的语法
+
+~~~makefile
+# 条件表达式的语法为：
+<conditional-directive>
+<text-if-true>
+endif
+# 以及：
+<conditional-directive>
+<text-if-true>
+else
+<text-if-false>
+endif
+~~~
+
+其中`<conditional-directive>`表示条件关键字，如“`ifeq`”。这个关键字有四种。
+
+* 第一个是我们前面所见过的“`ifeq`”
+
+~~~makefile
+ifeq (<arg1>, <arg2>)
+ifeq '<arg1>' '<arg2>'
+ifeq "<arg1>" "<arg2>"
+ifeq "<arg1>" '<arg2>'
+ifeq '<arg1>' "<arg2>"
+# 比较参数“arg1”和“arg2”的值是否相同。当然，参数中我们还可以使用make的函数。 如：
+ifeq ($(strip $(foo)),)
+<text-if-empty>
+endif
+# 这个示例中使用了“strip”函数，如果这个函数的返回值是空（Empty），那么<text-if-empty>就生效。
+~~~
+
+* 第二个条件关键字是“`ifneq`”。语法是：
+
+~~~makefile
+ifneq (<arg1>, <arg2>)
+ifneq '<arg1>' '<arg2>'
+ifneq "<arg1>" "<arg2>"
+ifneq "<arg1>" '<arg2>'
+ifneq '<arg1>' "<arg2>"
+# 其比较参数“arg1”和“arg2”的值是否相同，如果不同，则为真。和“ifeq”类似。
+~~~
+
+* 第三个条件关键字是“ifdef”。语法是：
+
+~~~makefile
+ifdef <variable-name>
+~~~
+
+如果变量`<variable-name>`的值非空，那到表达式为真。否则，表达式为假。当然，`<variable-name>`同样可以是一个函数的返回值。注意，ifdef只是测试一个变量是否有值，其并不会把变量扩展到当前位置。还是来看两个例子：
+
+~~~makefile
+# 示例一：
+bar =
+foo = $(bar)
+ifdef foo
+frobozz = yes
+else
+frobozz = no
+endif
+# 示例二：
+foo =
+ifdef foo
+frobozz = yes
+else
+frobozz = no
+endif
+# 第一个例子中，“$(frobozz)”值是“yes”，第二个则是“no”。
+~~~
+
+第四个条件关键字是“`ifndef`”。其语法是：
+
+~~~makefile
+ifndef <variable-name>
+~~~
+
+这个我就不多说了，和“ifdef”是相反的意思。
+
+在`<conditional-directive>`这一行上，多余的空格是被允许的，但是不能以`[Tab]`键做为开始（不然就被认为是命令）。而注释符“`#`”同样也是安全的。“`else`”和“`endif`”也一样，只要不是以`[Tab]`键开始就行了。
+
+特别注意的是，make是在读取Makefile时就计算条件表达式的值，并根据条件表达式的值来选择语句，所以，你==最好不要把自动化变量（如“`$@`”等）放入条件表达式中，因为自动化变量是在运行时才有的==。而且，为了避免混乱，make不允许把整个条件语句分成两部分放在不同的文件中。
+
+#### example 5.1.1
+
+~~~makefile
+# filename: makefile.example13
+# The syntax of conditional judgment in Makefile.(ifeq, ifneq, ifdef, ifndef)
+a0 = iftest
+b0 = iftest
+c0 = iftest11
+
+# Usage of ifeq and ifneq:
+ifeq ($(a0), $(b0))
+re_a0_eq_b0 = "yes"
+else
+re_a0_eq_b0 = "no"
+endif
+
+ifeq ($(a0), $(c0))
+re_a0_eq_c0 = "yes"
+else
+re_a0_eq_c0 = "no"
+endif
+
+ifneq ($(a0), $(b0))
+re_a0_neq_b0 = "yes"
+else
+re_a0_neq_b0 = "no"
+endif
+
+ifneq ($(a0), $(c0))
+re_a0_neq_c0 = "yes"
+else
+re_a0_neq_c0 = "no"
+endif
+#-----------------------------------------
+# Usage of ifdef and ifndef:
+sss=1
+ifdef sss
+sss_is_defined = "yes"
+else
+sss_is_defined = "no"
+endif
+
+xxx=
+ifndef xxx
+xxx_is_not_defined = "yes"
+else
+xxx_is_not_defined = "no"
+endif
+
+all:
+	@echo "==========Usage of ifeq and ifneq:=============="; \
+	echo "[a0]:$(a0)\t[b0]:$(b0)\t[c0]:$(c0)"; \
+	echo "-------------------------------------------------"; \
+	echo "[re_a0_eq_b0]:$(re_a0_eq_b0)."; \
+	echo "[re_a0_eq_c0]:$(re_a0_eq_c0)."; \
+	echo "-------------------------------------------------"; \
+	echo "[re_a0_neq_b0]:$(re_a0_neq_b0)."; \
+	echo "[re_a0_neq_c0]:$(re_a0_neq_c0)."; \
+	echo "-------------------------------------------------";
+	
+	@echo "==========Usage of ifdef and ifndef:=============="; \
+	echo "[sss]:$(sss)\t[xxx]:$(xxx)"; \
+	echo "-------------------------------------------------"; \
+	echo "[sss_is_defined]:$(sss_is_defined)."; \
+	echo "[xxx_is_not_defined]:$(xxx_is_not_defined)."; \
+	echo "-------------------------------------------------";
+	
+.PHONY: clean
+clean:
+	@echo "[example13]:clean"
+~~~
+
+~~~(空)
+make -f makefile.example13
+make[1]: Entering directory '/home/wangs7_ubuntu22/Github/code_Notes2/make_code'
+==========Usage of ifeq and ifneq:==============
+[a0]:iftest     [b0]:iftest     [c0]:iftest11
+-------------------------------------------------
+[re_a0_eq_b0]:yes.
+[re_a0_eq_c0]:no.
+-------------------------------------------------
+[re_a0_neq_b0]:no.
+[re_a0_neq_c0]:yes.
+-------------------------------------------------
+==========Usage of ifdef and ifndef:==============
+[sss]:1 [xxx]:
+-------------------------------------------------
+[sss_is_defined]:yes.
+[xxx_is_not_defined]:yes.
+-------------------------------------------------
+make[1]: Leaving directory '/home/wangs7_ubuntu22/Github/code_Notes2/make_code'
+~~~
 
 
 
 ## 6 Makefile 中使用函数
+
+在Makefile中可以使用函数来处理变量，从而让我们的命令或是规则更为的灵活和具有智能。make所支持的函数也不算很多，不过已经足够我们的操作了。函数调用后，函数的返回值可以当做变量来使用。
+
+### 6.1 函数的调用语法
+
+函数调用，很像变量的使用，也是以“$”来标识的，其语法如下：
+
+~~~makefile
+$(<function> <arguments>)
+# 或是
+${<function> <arguments>}
+~~~
+
+这里，`<function>`就是函数名，make支持的函数不多。`<arguments>`是函数的参数，参数间以逗号“`,`”分隔，而函数名和参数之间以“`空格`”分隔。函数调用以“`$`”开头，以圆括号或花括号把函数名和参数括起。感觉很像一个变量，是不是？函数中的参数可以使用变量，为了风格的统一，函数和变量的括号最好一样，如使用“`$(subst a,b,$(x))`”这样的形式，而不是“`$(subst a,b,${x})`”的形式。因为统一会更清楚，也会减少一些不必要的麻烦。还是来看一个示例：
+
+~~~makefile
+comma:= ,
+empty:=
+space:= $(empty) $(empty)
+foo:= a b c
+bar:= $(subst $(space),$(comma),$(foo))
+~~~
+
+在这个示例中，`$(comma)`的值是一个逗号。`$(space)`使用了`$(empty)`定义了一个空格，`$(foo)`的值是“a b c”，`$(bar)`的定义用，调用了函数“`subst`”，这是一个替换函数，这个函数有三个参数，第一个参数是被替换字串，第二个参数是替换字串，第三个参数是替换操作作用的字串。这个函数也就是把`$(foo)`中的空格替换成逗号，所以`$(bar)`的值是“a,b,c”。
+
+#### example 6.1.1
+
+~~~makefile
+# filename: makefile.example14
+# Use case of subst function
+comma:= ,
+empty:=
+space:= $(empty) $(empty)
+foo:= a b c
+bar:= $(subst $(space),$(comma),$(foo))
+
+all:
+	@echo "==========Use case of subst function:=============="; \
+	echo "[foo]:$(foo)\t[bar]:$(bar)"; \
+	echo "-------------------------------------------------"; 
+	
+.PHONY: clean
+clean:
+	@echo "[example14]:clean"
+~~~
+
+~~~(空)
+make -f makefile.example14
+make[1]: Entering directory '/home/wangs7_ubuntu22/Github/code_Notes2/make_code'
+==========Use case of subst function:==============
+[foo]:a b c     [bar]:a,b,c
+-------------------------------------------------
+~~~
+
+### 6.2 字符串处理函数
+
+#### subst 字符串替换函数
+
+~~~makefile
+$(subst <from>,<to>,<text>)
+~~~
+
+* 名称：字符串替换函数——`subst`。
+* 功能：把字串`<text>`中的`<from>`字符串替换成`<to>`。
+* 返回：函数返回被替换过后的字符串。
+
+示例：
+
+~~~makefile
+$(subst ee,EE,feet on the street)，
+# 把“feet on the street”中的“ee”替换成“EE”，返回结果是“fEEt on the strEEt”。
+~~~
+
+
+
+#### patsubst 模式字符串替换函数
+
+~~~makefile
+$(patsubst <pattern>,<replacement>,<text>)
+~~~
+
+* 名称：模式字符串替换函数——patsubst。
+* 功能：查找`<text>`中的单词（单词以“`空格`”、“`Tab`”或“`回车`”、“`换行`”分隔）是否符合模式`<pattern>`，如果匹配的话，则以`<replacement>`替换。这里，`<pattern>`可以包括通配符“`%`”，表示任意长度的字串。如果`<replacement>`中也包含“`%`”，那么，`<replacement>`中的这个“`%`”将是`<pattern>`中的那个“`%`”所代表的字串。（可以用“`\`”来转义，以“`\%`”来表示真实含义的“`%`”字符）。
+* 返回：函数返回被替换过后的字符串。
+
+示例：
+
+~~~makefile
+$(patsubst %.c,%.o,x.c.c bar.c)
+# 把字串“x.c.c bar.c”符合模式[%.c]的单词替换成[%.o]，返回结果是“x.c.o bar.o”
+~~~
+
+备注：
+
+~~~(空)
+这和我们前面“变量章节”说过的相关知识有点相似。如：
+“$(var:<pattern>=<replacement>)”相当于“$(patsubst <pattern>,<replacement>,$(var))”，
+而“$(var: <suffix>=<replacement>)”则相当于“$(patsubst %<suffix>,%<replacement>,$(var))”。
+例如有：objects = foo.o bar.o baz.o，
+那么，“$(objects:.o=.c)”和“$(patsubst %.o,%.c,$(objects))”是一样的。
+~~~
+
+#### strip 去空格函数
+
+~~~makefile
+$(strip <string>)
+~~~
+
+* 名称：去空格函数——strip。
+* 功能：去掉`<string>`字串中开头和结尾的空字符。
+* 返回：返回被去掉空格的字符串值。
+
+示例：
+
+~~~makefile
+$(strip a b c )
+# 把字串“a b c ”去到开头和结尾的空格，结果是“a b c”。
+~~~
+
+#### findstring 查找字符串函数
+
+~~~makefile
+$(findstring <find>,<in>)
+~~~
+
+* 名称：查找字符串函数——findstring。
+* 功能：在字串`<in>`中查找`<find>`字串。
+* 返回：如果找到，那么返回`<find>`，否则返回空字符串。
+
+示例：
+
+~~~makefile
+$(findstring a,a b c)
+$(findstring a,b c)
+# 第一个函数返回“a”字符串，第二个返回“”字符串（空字符串）
+~~~
+
+
+
+#### filter 过滤函数 & filter-out 反过滤函数
+
+1. **filter 过滤函数**
+
+~~~makefile
+$(filter <pattern...>,<text>)
+~~~
+
+* 名称：过滤函数——filter。
+* 功能：以`<pattern>`模式过滤`<text>`字符串中的单词，保留符合模式`<pattern>`的单词。可以有多个模式。
+* 返回：返回符合模式`<pattern>`的字串。
+
+示例：
+
+~~~makefile
+sources := foo.c bar.c baz.s ugh.h
+foo: $(sources)
+cc $(filter %.c %.s,$(sources)) -o foo
+# $(filter %.c %.s,$(sources))返回的值是“foo.c bar.c baz.s”。
+~~~
+
+2. **filter-out 反过滤函数**
+
+~~~makefile
+$(filter-out <pattern...>,<text>)
+~~~
+
+* 名称：反过滤函数——filter-out。
+* 功能：以`<pattern>`模式过滤`<text>`字符串中的单词，去除符合模式`<pattern>`的单词。可以有多个模式。
+* 返回：返回不符合模式`<pattern>`的字串。
+
+示例：
+
+~~~makefile
+objects=main1.o foo.o main2.o bar.o
+mains=main1.o main2.o
+$(filter-out $(mains),$(objects)) # 返回值是“foo.o bar.o”。
+~~~
+
+#### sort 排序函数
+
+~~~makefile
+$(sort <list>)
+~~~
+
+* 名称：排序函数——sort。
+* 功能：给字符串`<list>`中的单词排序（升序）。
+* 返回：返回排序后的字符串。
+
+示例：
+
+~~~makefile
+$(sort foo bar lose) # 返回“bar foo lose” 。
+# 备注：sort函数会去掉<list>中相同的单词。
+~~~
+
+
+
+#### word 取单词函数 & wordlist 取单词串函数
+
+1. **word 取单词函数**
+
+~~~makefile
+$(word <n>,<text>)
+~~~
+
+* 名称：取单词函数——word。
+* 功能：取字符串`<text>`中第`<n>`个单词。（从一开始）
+* 返回：返回字符串`<text>`中第`<n>`个单词。如果`<n>`比`<text>`中的单词数要大，那么返回空字符串。
+
+示例：
+
+~~~makefile
+$(word 2, foo bar baz)# 返回值是“bar”。
+~~~
+
+2. **wordlist 取单词串函数**
+
+~~~makefile
+$(wordlist <s>,<e>,<text>)
+~~~
+
+* 名称：取单词串函数——wordlist。
+* 功能：从字符串`<text>`中取从`<s>`开始到`<e>`的单词串。`<s>`和`<e>`是一个数字。
+* 返回：返回字符串`<text>`中从`<s>`到`<e>`的单词字串。如果`<s>`比`<text>`中的单词数要大，那么返回空字符串。如果`<e>`大于`<text>`的单词数，那么返回从`<s>`开始，到`<text>`结束的单词串。
+
+示例：
+
+~~~makefile
+$(wordlist 2, 3, foo bar baz)# 返回值是“bar baz”。
+~~~
+
+
+
+#### words 单词个数统计函数 & firstword 首单词函数
+
+1. **words 单词个数统计函数**
+
+~~~makefile
+$(words <text>)
+~~~
+
+* 名称：单词个数统计函数——words。
+* 功能：统计`<text>`中字符串中的单词个数。
+* 返回：返回`<text>`中的单词数。
+
+示例：
+
+~~~makefile
+$(words foo bar baz)# 返回值是“3”。
+~~~
+
+2. **firstword 首单词函数**
+
+~~~makefile
+$(firstword <text>)
+~~~
+
+* 名称：首单词函数——firstword。
+* 功能：取字符串`<text>`中的第一个单词。
+* 返回：返回字符串`<text>`的第一个单词。
+
+示例：
+
+~~~makefile
+$(firstword foo bar)# 返回值是“foo”。
+~~~
+
+
+
+#### example 6.2.x
+
+以上函数用例如下：
+
+~~~makefile
+# filename: makefile.example14
+# Use case of subst function
+comma:= ,
+empty:=
+space:= $(empty) $(empty)
+foo:= a b c
+bar:= $(subst $(space),$(comma),$(foo))
+
+# Use case of patsubst function
+patsubst_input = "x.c.c bar.c"
+patsubst_res = $(patsubst %.c,%.o,$(patsubst_input))
+
+# Use case of strip function
+strip_input = "a b c "
+strip_res = $(strip $(strip_input))
+
+# Use case of findstring function
+findstring_input = "a b c"
+findstring_target1 = a
+findstring_target2 = e
+findstring_res1 = $(findstring $(findstring_target1),$(findstring_input))
+findstring_res2 = $(findstring $(findstring_target2),$(findstring_input))
+
+# Use case of filter and filter-out function
+sources_filter := foo.c bar.c baz.s ugh.h
+filter_res = $(filter %.c %.s,$(sources_filter))
+
+objects_filter-out = main1.o foo.o main2.o bar.o
+mains = main1.o main2.o
+filter-out_res = $(filter-out $(mains),$(objects_filter-out))
+
+# Use case of sort function
+sort_input = foo bar lose
+sort_res = $(sort $(sort_input))
+
+# Use case of word and wordlist function
+world_input := foo bar baz
+index_2 = 2
+index_3 = 3
+word_res = $(word $(index_2), $(world_input))
+wordlist_res = $(wordlist $(index_2), $(index_3), $(world_input))
+
+# Use case of words and firstword  function
+words_res = $(words $(world_input))
+firstword_res = $(firstword $(world_input))
+
+all: subst-case patsubst-case strip-case findstring-case filter-case \
+	sort-case world-case worlds-case
+
+subst-case:
+	@echo "==========Use case of subst function:=============="; \
+	echo "[foo]:$(foo)\t[bar]:$(bar)"; \
+	echo "-------------------------------------------------"; 
+patsubst-case:
+	@echo "==========Use case of patsubst function:=============="; \
+	echo "[patsubst_input]:$(patsubst_input)\t[patsubst_res]:$(patsubst_res)"; \
+	echo "-------------------------------------------------"; 
+strip-case:
+	@echo "==========Use case of strip function:=============="; \
+	echo "[strip_input]:$(strip_input).\t[strip_res]:$(strip_res)."; \
+	echo "-------------------------------------------------"; 
+findstring-case:
+	@echo "==========Use case of findstring function:=============="; \
+	echo "[findstring_input]:$(findstring_input)\t[findstring_target1]:$(findstring_target1)\t[findstring_target2]:$(findstring_target2)"; \
+	echo "[findstring_res1]:$(findstring_res1)\n[findstring_res2]:$(findstring_res2)"; \
+	echo "-------------------------------------------------"; 
+filter-case:
+	@echo "==========Use case of filter and filter-out function:=============="; \
+	echo "[sources_filter]:$(sources_filter)\t[filter_res]:$(filter_res)"; \
+	echo "[objects_filter-out]:$(objects_filter-out)\t[mains]:$(mains)\t[filter-out_res]:$(filter-out_res)"; \
+	echo "-------------------------------------------------"; 
+sort-case:
+	@echo "==========Use case of sort function:=============="; \
+	echo "[sort_input]:$(sort_input).\t[sort_res]:$(sort_res)."; \
+	echo "-------------------------------------------------"; 
+world-case:
+	@echo "==========Use case of word and wordlist function:=============="; \
+	echo "[world_input]:$(world_input)\t[index_2]:$(index_2)\t[index_3]:$(index_3)"; \
+	echo "[word_res]:$(word_res)\n[wordlist_res]:$(wordlist_res)"; \
+	echo "-------------------------------------------------"; 
+worlds-case:
+	@echo "==========Use case of words and firstword  function:=============="; \
+	echo "[world_input]:$(world_input)"; \
+	echo "[words_res]:$(words_res)\n[firstword_res]:$(firstword_res)"; \
+	echo "-------------------------------------------------"; 
+.PHONY: clean
+clean:
+	@echo "[example14]:clean"
+
+~~~
+
+~~~(空)
+make -f makefile.example14
+make[1]: Entering directory '/home/wangs7_ubuntu22/Github/code_Notes2/make_code'
+==========Use case of subst function:==============
+[foo]:a b c     [bar]:a,b,c
+-------------------------------------------------
+==========Use case of patsubst function:==============
+[patsubst_input]:x.c.c bar.c    [patsubst_res]:x.c.o bar.c
+-------------------------------------------------
+==========Use case of strip function:==============
+[strip_input]:a b c .   [strip_res]:a b c .
+-------------------------------------------------
+==========Use case of findstring function:==============
+[findstring_input]:a b c        [findstring_target1]:a  [findstring_target2]:e
+[findstring_res1]:a
+[findstring_res2]:
+-------------------------------------------------
+==========Use case of filter and filter-out function:==============
+[sources_filter]:foo.c bar.c baz.s ugh.h        [filter_res]:foo.c bar.c baz.s
+[objects_filter-out]:main1.o foo.o main2.o bar.o        [mains]:main1.o main2.o [filter-out_res]:foo.o bar.o
+-------------------------------------------------
+==========Use case of sort function:==============
+[sort_input]:foo bar lose.      [sort_res]:bar foo lose.
+-------------------------------------------------
+==========Use case of word and wordlist function:==============
+[world_input]:foo bar baz       [index_2]:2     [index_3]:3
+[word_res]:bar
+[wordlist_res]:bar baz
+-------------------------------------------------
+==========Use case of words and firstword  function:==============
+[world_input]:foo bar baz
+[words_res]:3
+[firstword_res]:foo
+-------------------------------------------------
+make[1]: Leaving directory '/home/wangs7_ubuntu22/Github/code_Notes2/make_code'
+~~~
+
+所有结构均符合预期。
+
+### 6.3 文件名操作函数
+
+下面我们要介绍的函数主要是处理文件名的。每个函数的参数字符串都会被当做一个或是一系列的文件名来对待。
+
+**dir 取目录函数**
+
+~~~makefile
+$(dir <names...>)
+#示例： 
+$(dir src/foo.c hacks) # 返回值是“src/ ./”。
+~~~
+
+* 名称：取目录函数——dir。
+* 功能：从文件名序列`<names>`中取出目录部分。目录部分是指最后一个反斜杠（“`/`”）之前的部分。如果没有反斜杠，那么返回“`./`”。
+* 返回：返回文件名序列`<names>`的目录部分。
+
+-------------------
+
+**notdir 取文件函数**
+
+~~~makefile
+$(notdir <names...>)
+# 示例： 
+$(notdir src/foo.c hacks) # 返回值是“foo.c hacks”。
+~~~
+
+* 名称：取文件函数——notdir。
+* 功能：从文件名序列`<names>`中取出非目录部分。非目录部分是指最后一个反斜杠（“`/`”）之后的部分。
+* 返回：返回文件名序列`<names>`的非目录部分。
+
+-----------------------
+
+**suffix 取后缀函数**
+
+~~~makefile
+$(suffix <names...>)
+# 示例：
+$(suffix src/foo.c src-1.0/bar.c hacks) # 返回值是“.c .c”。
+~~~
+
+* 名称：取后缀函数——suffix。
+* 功能：从文件名序列`<names>`中取出各个文件名的后缀。
+* 返回：返回文件名序列`<names>`的后缀序列，如果文件没有后缀，则返回空字串。
+
+-------------------
+
+**basename 取前缀函数**
+
+~~~makefile
+$(basename <names...>)
+# 示例：
+$(basename src/foo.c src-1.0/bar.c hacks) # 返回值是“src/foo src-1.0/bar hacks”。
+~~~
+
+* 名称：取前缀函数——basename。
+* 功能：从文件名序列`<names>`中取出各个文件名的前缀部分。
+* 返回：返回文件名序列`<names>`的前缀序列，如果文件没有前缀，则返回空字串。
+
+-------------
+
+**addsuffix 加后缀函数**
+
+~~~makefile
+$(addsuffix <suffix>,<names...>)
+# 示例：
+$(addsuffix .c,foo bar) # 返回值是“foo.c bar.c”。
+~~~
+
+* 名称：加后缀函数——addsuffix。
+* 功能：把后缀`<suffix>`加到`<names>`中的每个单词后面。
+* 返回：返回加过后缀的文件名序列。
+
+--------------------
+
+**addprefix 加前缀函数**
+
+~~~makefile
+$(addprefix <prefix>,<names...>)
+# 示例：
+$(addprefix src/,foo bar) # 返回值是“src/foo src/bar”。
+~~~
+
+* 名称：加前缀函数——addprefix。
+* 功能：把前缀`<prefix>`加到`<names>`中的每个单词前面。
+* 返回：返回加过前缀的文件名序列。
+
+-------------
+
+**join 连接函数**
+
+~~~makefile
+$(join <list1>,<list2>)
+# 示例：
+$(join aaa bbb , 111 222 333) # 返回值是“aaa111 bbb222 333”。
+~~~
+
+* 名称：连接函数——join。
+* 功能：把`<list2>`中的单词对应地加到`<list1>`的单词后面。如果`<list1>`的单词个数要比`<list2>`的多，那么，`<list1>`中的多出来的单词将保持原样。如果`<list2>`的单词个数要比`<list1>`多，那么，`<list2>`多出来的单词将被复制到`<list2>`中。
+* 返回：返回连接过后的字符串。
+
+--------------
+
+#### example 6.3.x
+
+~~~makefile
+# filename: makefile.example15
+# Use case for file name operation function in Makefile.
+
+# Use case of dir function
+dir_input = src/foo.c text.g
+dir_res = $(dir $(dir_input))
+ 
+# Use case of notdir function
+notdir_input = src/foo.c text.g
+notdir_res = $(notdir $(notdir_input))
+
+# Use case of suffix function
+suffix_input = src/foo.c example11_dir/defs.h text.g
+suffix_res = $(suffix $(suffix_input))
+
+# Use case of basename function
+basename_input = src/foo.c example11_dir/defs.h text.g
+basename_res = $(basename $(basename_input))
+
+# Use case of addsuffix function
+addsuffix_input = foo bar
+addsuffix_res = $(addsuffix .c,$(addsuffix_input))
+
+# Use case of join function
+join_list1 = aaa bbb
+join_list2 = 111 222 333
+join_res = $(join $(join_list1), $(join_list2)) 
+
+all: dir-case notdir-case suffix-case basename-case addsuffix-case join-case
+
+dir-case:
+	@echo "==========Use case of dir function:=============="; \
+	echo "[dir_input]:$(dir_input)\t[dir_res]:$(dir_res)"; \
+	echo "-------------------------------------------------"; 
+notdir-case:
+	@echo "==========Use case of notdir function:=============="; \
+	echo "[notdir_input]:$(notdir_input)\t[notdir_res]:$(notdir_res)"; \
+	echo "-------------------------------------------------"; 
+suffix-case:
+	@echo "==========Use case of suffix function:=============="; \
+	echo "[suffix_input]:$(suffix_input)\t[suffix_res]:$(suffix_res)"; \
+	echo "-------------------------------------------------"; 
+basename-case:
+	@echo "==========Use case of basename function:=============="; \
+	echo "[basename_input]:$(basename_input)\t[basename_res]:$(basename_res)"; \
+	echo "-------------------------------------------------"; 
+addsuffix-case:
+	@echo "==========Use case of addsuffix function:=============="; \
+	echo "[addsuffix_input]:$(addsuffix_input)\t[addsuffix_res]:$(addsuffix_res)"; \
+	echo "-------------------------------------------------"; 
+join-case:
+	@echo "==========Use case of join function:=============="; \
+	echo "[join_list1]:$(join_list1)\t[join_list2]:$(join_list2)"; \
+	echo "[join_res]:$(join_res)"; \
+	echo "-------------------------------------------------"; 
+
+.PHONY: clean
+clean:
+	@echo "[example15]:clean"
+	
+~~~
+
+~~~(空)
+make -f makefile.example15
+make[1]: Entering directory '/home/wangs7_ubuntu22/Github/code_Notes2/make_code'
+==========Use case of dir function:==============
+[dir_input]:src/foo.c text.g    [dir_res]:src/ ./
+-------------------------------------------------
+==========Use case of notdir function:==============
+[notdir_input]:src/foo.c text.g [notdir_res]:foo.c text.g
+-------------------------------------------------
+==========Use case of suffix function:==============
+[suffix_input]:src/foo.c example11_dir/defs.h text.g    [suffix_res]:.c .h .g
+-------------------------------------------------
+==========Use case of basename function:==============
+[basename_input]:src/foo.c example11_dir/defs.h text.g  [basename_res]:src/foo example11_dir/defs text
+-------------------------------------------------
+==========Use case of addsuffix function:==============
+[addsuffix_input]:foo bar       [addsuffix_res]:foo.c bar.c
+-------------------------------------------------
+==========Use case of join function:==============
+[join_list1]:aaa bbb    [join_list2]:111 222 333
+[join_res]:aaa111 bbb222 333 
+-------------------------------------------------
+make[1]: Leaving directory '/home/wangs7_ubuntu22/Github/code_Notes2/make_code'
+~~~
+
+
+
+### 6.4 foreach 函数
+
+
+
+### 6.5 if 函数
+
+
+
+### 6.6 call 函数
+
+
+
+### 6.7 origin函数
+
+
+
+### 6.8 shell 函数
+
+
+
+### 6.9 控制make的函数
 
 
 
