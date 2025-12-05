@@ -10,5 +10,5 @@
 
 ## [第三章 字符驱动](./driver_note_3.md) 
 
-
+## [第四章 调试技术](./driver_note_4.md) 
 
