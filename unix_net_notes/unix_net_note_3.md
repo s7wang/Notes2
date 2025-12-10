@@ -898,6 +898,375 @@ int main(void)
 
 ## 3.8 sock_ntop 和相关函数
 
+【sock_ntop 是自建函数不是系统调用】
+
+`inet_ntop`的一个基本问题是：它要求调用者传递一个指向某个二进制地址的指针，而该地址通常包含在一个套接字地址结构中，这就要求调用者必须知道这个结构的格式和地址族。这就是说，为了使用这个函数，我们必须为IPv4编写如下代码：
+
+~~~c
+struct sockaddr_in addr;
+inet_ntop(AF_INET, &addr.sin_addr, str, sizeof (str)）;
+~~~
+
+或为IPv6编写如下代码：
+
+~~~c
+struct sockaddr_in6 addr6;
+inet_ntop(AF_INET6, &addr6.sin6_addr, str, sizeof (str)）;
+~~~
+
+这就使得我们的代码与协议相关了。为了解决这个问题，我们将自行编写一个名为`sock_ntop`的函数，它以指向某个套接字地址结构的指针为参数，查看该结构的内部，然后调用适当的函数返回该地址的表达格式。
+
+~~~c
+char *sock_ntop(const struct sockaddr *sockaddr, socklen_t addrlen);
+				// 返回: 若成功则非空指针，若出错则为NULL
+~~~
+
+> 这就是本书通篇使用的我们自己定义的函数（非标准系统函数）的说明形式：包围函数原型和返回值的方框是虚线。开头包括的头文件通常是我们自己的`unp.h`。
+
+`sockaddr`指向一个长度为`addrlen`的套接字地址结构。本函数用它自己的静态缓冲区来保存结果，而指向该缓冲区的一个指针就是它的返回值。
+
+> 注意：对结果进行静态存储导致该函数不可重入且非线程安全。这些概念我们将在11.18节中进一步讨论。对于该函数我们作这样的设计决策是为了让本书中的简单例子方便地调用它。
+
+表达格式就是在一个`IPv4`地址的点分十进制数串格式之后，或者在一个括以方括号的`IPv6`地址的十六进制数串格式之后，跟一个终止符（我们使用一个分号，类似于URL语法)，再跟一个十进制的端口号，最后跟一个空字符。因此，缓冲区大小对于`IPv4`至少为`INET_ADDRSTRLEN`加上6个字节（16+6=22），对于`IPv6`至少为`INET6_ADDRSTRLEN`加上8个字节（46+8=54)。
+
+~~~c
+#include	"unp.h"
+
+#ifdef	HAVE_SOCKADDR_DL_STRUCT
+#include	<net/if_dl.h>
+#endif
+
+/* include sock_ntop */
+char *
+sock_ntop(const struct sockaddr *sa, socklen_t salen)
+{
+    char		portstr[8];
+    static char str[128];		/* Unix domain is largest */
+
+	switch (sa->sa_family) {
+	case AF_INET: {
+		struct sockaddr_in	*sin = (struct sockaddr_in *) sa;
+
+		if (inet_ntop(AF_INET, &sin->sin_addr, str, sizeof(str)) == NULL)
+			return(NULL);
+		if (ntohs(sin->sin_port) != 0) {
+			snprintf(portstr, sizeof(portstr), ":%d", ntohs(sin->sin_port));
+			strcat(str, portstr);
+		}
+		return(str);
+	}
+/* end sock_ntop */
+
+#ifdef	IPV6
+	case AF_INET6: {
+		struct sockaddr_in6	*sin6 = (struct sockaddr_in6 *) sa;
+
+		str[0] = '[';
+		if (inet_ntop(AF_INET6, &sin6->sin6_addr, str + 1, sizeof(str) - 1) == NULL)
+			return(NULL);
+		if (ntohs(sin6->sin6_port) != 0) {
+			snprintf(portstr, sizeof(portstr), "]:%d", ntohs(sin6->sin6_port));
+			strcat(str, portstr);
+			return(str);
+		}
+		return (str + 1);
+	}
+#endif
+
+#ifdef	AF_UNIX
+	case AF_UNIX: {
+		struct sockaddr_un	*unp = (struct sockaddr_un *) sa;
+
+			/* OK to have no pathname bound to the socket: happens on
+			   every connect() unless client calls bind() first. */
+		if (unp->sun_path[0] == 0)
+			strcpy(str, "(no pathname bound)");
+		else
+			snprintf(str, sizeof(str), "%s", unp->sun_path);
+		return(str);
+	}
+#endif
+
+#ifdef	HAVE_SOCKADDR_DL_STRUCT
+	case AF_LINK: {
+		struct sockaddr_dl	*sdl = (struct sockaddr_dl *) sa;
+
+		if (sdl->sdl_nlen > 0)
+			snprintf(str, sizeof(str), "%*s (index %d)",
+					 sdl->sdl_nlen, &sdl->sdl_data[0], sdl->sdl_index);
+		else
+			snprintf(str, sizeof(str), "AF_LINK, index=%d", sdl->sdl_index);
+		return(str);
+	}
+#endif
+	default:
+		snprintf(str, sizeof(str), "sock_ntop: unknown AF_xxx: %d, len %d",
+				 sa->sa_family, salen);
+		return(str);
+	}
+    return (NULL);
+}
+
+char *
+Sock_ntop(const struct sockaddr *sa, socklen_t salen)
+{
+	char	*ptr;
+
+	if ( (ptr = sock_ntop(sa, salen)) == NULL)
+		err_sys("sock_ntop error");	/* inet_ntop() sets errno */
+	return(ptr);
+}
+~~~
+
+我们还为操作套接字地址结构定义了其他几个函数，它们将简化我们的代码在`IPv4`与`IPv6`之间的移植。
+
+~~~c
+int		 sock_bind_wild(int, int);
+int		 sock_cmp_addr(const SA *, const SA *, socklen_t);
+int		 sock_cmp_port(const SA *, const SA *, socklen_t);
+int		 sock_get_port(const SA *, socklen_t);
+void	 sock_set_addr(SA *, socklen_t, const void *);
+void	 sock_set_port(SA *, socklen_t, int);
+void	 sock_set_wild(SA *, socklen_t);
+~~~
+
+说明：略。
+
+
+
+## 3.9 readn、writen 和 readline 函数
+
+【readn、writen 和 readline 是自建函数不是系统调用】
+
+字节流套接字（例如TCP套接字）上的`read`和`write`函数所表现的行为不同于通常的文件`I/O`。字节流套接字上调用`read`或`write`输入或输出的字节数可能比请求的数量少，然而这不是出错的状态。这个现象的原因在于内核中用于套接字的缓冲区可能已达到了极限。此时所需的是调用者再次调用`read`或`write`函数，以输入或输出剩余的字节。有些版本的Unix在往一个管道中写多于4096字节的数据时也会表现出这样的行为。这个现象在`read`一·个字节流套接字时很常见，但是在`write`一个字节流套接字时只能在该套接字为非阻塞的前提下才出现。尽管如此，为预防万一，不让实现返回一个不足的字节计数值，我们总是改为调用`writen`函数来取代`write`函数。我们提供的以下3个函数是每当我们读或写一个字节流套接字时总要使用的函数。
+
+~~~c
+ssize_t	 readn(int, void *, size_t);
+ssize_t	 writen(int, const void *, size_t);
+
+ssize_t	 readline(int, void *, size_t);
+~~~
+
+具体实现：
+
+* readn
+
+~~~c
+/* include readn */
+#include	"unp.h"
+
+ssize_t						/* Read "n" bytes from a descriptor. */
+readn(int fd, void *vptr, size_t n)
+{
+	size_t	nleft;
+	ssize_t	nread;
+	char	*ptr;
+
+	ptr = vptr;
+	nleft = n;
+	while (nleft > 0) {
+		if ( (nread = read(fd, ptr, nleft)) < 0) {
+			if (errno == EINTR)
+				nread = 0;		/* and call read() again */
+			else
+				return(-1);
+		} else if (nread == 0)
+			break;				/* EOF */
+
+		nleft -= nread;
+		ptr   += nread;
+	}
+	return(n - nleft);		/* return >= 0 */
+}
+/* end readn */
+
+ssize_t
+Readn(int fd, void *ptr, size_t nbytes)
+{
+	ssize_t		n;
+
+	if ( (n = readn(fd, ptr, nbytes)) < 0)
+		err_sys("readn error");
+	return(n);
+}
+
+~~~
+
+* writen
+
+~~~c
+/* include writen */
+#include	"unp.h"
+
+ssize_t						/* Write "n" bytes to a descriptor. */
+writen(int fd, const void *vptr, size_t n)
+{
+	size_t		nleft;
+	ssize_t		nwritten;
+	const char	*ptr;
+
+	ptr = vptr;
+	nleft = n;
+	while (nleft > 0) {
+		if ( (nwritten = write(fd, ptr, nleft)) <= 0) {
+			if (nwritten < 0 && errno == EINTR)
+				nwritten = 0;		/* and call write() again */
+			else
+				return(-1);			/* error */
+		}
+
+		nleft -= nwritten;
+		ptr   += nwritten;
+	}
+	return(n);
+}
+/* end writen */
+
+void
+Writen(int fd, void *ptr, size_t nbytes)
+{
+	if (writen(fd, ptr, nbytes) != nbytes)
+		err_sys("writen error");
+}
+
+~~~
+
+* readline
+
+~~~c
+/* include readline */
+#include	"unp.h"
+/* PAINFULLY SLOW VERSION-- example Only */
+ssize_t
+readline(int fd, void *vptr, size_t maxlen)
+{
+	ssize_t	n, rc;
+	char	c, *ptr;
+
+	ptr = vptr;
+	for (n = 1; n < maxlen; n++) {
+    again:
+		if ( (rc = read(fd, &c, 1)) == 1) {
+			*ptr++ = c;
+			if (c == '\n')
+				break;		/* newline is stored, like fgets{} */
+		} else if (rc == 0) {
+			*ptr = 0;
+			return(n - 1);	/* EOF, n -1 bytes were read */
+
+		} else
+            if (errno == EINTR)
+                goto again;
+			return(-1);		/* error, errno set, by read{} */
+	}
+	*ptr = 0;				/* null terminate like fgets{} */
+	return(n);
+}
+/* end readline */
+
+ssize_t
+Readline(int fd, void *ptr, size_t maxlen)
+{
+	ssize_t		n;
+
+	if ( (n = readline(fd, ptr, maxlen)) == -1)
+		err_sys("readline error");
+	return(n);
+}
+
+~~~
+
+上述三个函数查找`EINTR`错误（表示系统调用被一个捕获的信号中断，我们将在5.9节中更详细地讨论)，如果发生该错误则继续进行读或写操作。既然这些函数的作用是避免让调用者来处理不足的字节计数值，那么我们就地处理该错误，而不是强迫调用者再次调用`readn`或`writen`函数。在14.3节我们会提到，`MSG_WAITALL`标志可随`recv`函数一起使用来取代独立的`readn`函数。
+
+注意，这个`readline`函数每读一个字节的数据就调用一次系统的`read`函数。这是非常低效率的，为此我们特意在代码中注明“`PAINFULLYSLOW`（极端地慢)”。当面临从某个套接字读入文本行这一需求时，改用标准`I/O`函数库（称为stdio）相当诱人。我们将在14.8节中详细讨论这种方法，不过预先指出这是种危险的方法。解决本性能问题的stdio缓冲机制却引发许多后勤问题，可能导致在应用程序中存在相当隐蔽的缺陷。**究其原因在于stdio缓冲区的状态是不可见的。**为便于深入解释，让我们考虑客户和服务器之间的一个基于文本行的协议，而使用该协议的多个客户程序和服务器程序可能是在一段时间内先后实现的（这种情形其实相当普遍，举例来说，按照`HTTP`规范独立编写的Web浏览器程序和Web服务器程序就相当之多）。良好的防御性编程（defensive programming）技术要求这些程序不仅能够期望它们的对端程序也遵循相同的网络协议，而且能够检查出未预期的网络数据传送并加以修正（恶意企图自然也被检查出来），这样使得网络应用能够从存在问题的网络数据传送中恢复，可能的话还会继续工作。==为了提升性能而使用stdio来缓冲数据违背了这些目标，因为这样的应用进程在任何时刻都没有办法分辨stdio缓冲区中是否持有未预期的数据。==
+
+基于文本行的网络协议相当多，警如`SMTP`、`HTTP`、`FTP`的控制连接协议以及`finger`等。因此针对文本行操作这一需求一再被提出。然而我们的建议是依照缓冲区而不是文本行的要求来考虑编程。编写从缓冲区中读取数据的代码，当期待一个文本行时，就查看缓冲区中是否含有那一行。
+
+下图给出了`readline`函数的一个较快速版本，它使用自己的而不是stdio提供的缓冲机制。其中重要的是`readline`内部缓冲区的状态是暴露的，这使得调用者能够查看缓冲区中到底收到了什么。即使使用这个特性，`readline`仍可能存在问题，具体见6.3节。诸如`select`等系统函数仍然不可能知道`readline`使用的内部缓冲区，因此编写不严谨的程序很可能发现自己在`select`上等待的数据早已收到并存放在`readline`的缓冲区中了。由于这个原因，混合调用`readn`和`readline`不会像预期的那样工作，除非把`readn`修改成也检查该内部缓冲区。
+
+~~~c
+/* include readline */
+#include	"unp.h"
+
+static int	read_cnt;
+static char	*read_ptr;
+static char	read_buf[MAXLINE];
+
+static ssize_t
+my_read(int fd, char *ptr)
+{
+
+	if (read_cnt <= 0) {
+again:
+		if ( (read_cnt = read(fd, read_buf, sizeof(read_buf))) < 0) {
+			if (errno == EINTR)
+				goto again;
+			return(-1);
+		} else if (read_cnt == 0)
+			return(0);
+		read_ptr = read_buf;
+	}
+
+	read_cnt--;
+	*ptr = *read_ptr++;
+	return(1);
+}
+
+ssize_t
+readline(int fd, void *vptr, size_t maxlen)
+{
+	ssize_t	n, rc;
+	char	c, *ptr;
+
+	ptr = vptr;
+	for (n = 1; n < maxlen; n++) {
+		if ( (rc = my_read(fd, &c)) == 1) {
+			*ptr++ = c;
+			if (c == '\n')
+				break;	/* newline is stored, like fgets() */
+		} else if (rc == 0) {
+			*ptr = 0;
+			return(n - 1);	/* EOF, n - 1 bytes were read */
+		} else
+			return(-1);		/* error, errno set by read() */
+	}
+
+	*ptr = 0;	/* null terminate like fgets() */
+	return(n);
+}
+
+ssize_t
+readlinebuf(void **vptrptr)
+{
+	if (read_cnt)
+		*vptrptr = read_ptr;
+	return(read_cnt);
+}
+/* end readline */
+
+ssize_t
+Readline(int fd, void *ptr, size_t maxlen)
+{
+	ssize_t		n;
+	if ( (n = readline(fd, ptr, maxlen)) < 0)
+		err_sys("readline error");
+	return(n);
+}
+
+~~~
+
+内部函数`my_read`每次最多读`MAXLINE`个字符，然后每次返回一个字符。`readline`函数本身的唯一变化是用`my_read`调用取代`read`。`readlinebuf`这个新函数能够展露内部缓冲区的状态，便于调用者查看在当前文本行之后是否收到了新的数据。
+
+> 但是，在`readline.c`中使用静态变量实现跨相继函数调用的状态信息维护，其结果是这些函数变得不可重入或者说非线程安全了。我们将在11.18节和26.5节中讨论这一点。在后边我们将使用特定于线程的数据开发一个线程安全的版本。
+
+
+
+# END
+
+
+
+
+
 
 
 
