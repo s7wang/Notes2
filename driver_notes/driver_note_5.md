@@ -1681,7 +1681,7 @@ write_seqcount_end(&seq);
 
 ------
 
-4. 中断 / softirq 场景（LDD 没细讲）
+4. **中断 / softirq 场景（LDD 没细讲）**
 
 现代内核区分得非常清楚：
 
@@ -1701,17 +1701,397 @@ write_sequnlock_irqrestore(&lock, flags);
 
 ### 5.7.5 读取-拷贝-更新
 
+读取-拷贝-更新(RCU) 是一个高级的互斥方法, 能够有高效率在合适的情况下。它在驱动中的使用很少但是不是没人知道, 因此这里值得快速浏览下。那些感兴趣 RCU 算法的完整细节的人可以在由它的创建者出版的白皮书中找到 
+
+( http://www.rdrop.com/users/paulmck/rclock/intro/rclock_intro.html)。
+
+RCU 对它所保护的数据结构设置了不少限制。它对经常读而极少写的情况做了优化。被保护的资源应当通过指针来存取, 并且所有对这些资源的引用必须由原子代码持有。当数据结构需要改变, 写线程做一个拷贝, 改变这个拷贝, 接着使相关的指针对准新的版本 -- 因此, 有了算法的名子。内核确认没有留下对旧版本的引用, 它可以被释放。
+
+作为在真实世界中使用 RCU 的例子, 考虑一下网络路由表。每个外出的报文需要请求检查路由表来决定应当使用哪个接口。这个检查是快速的, 并且, 一旦内核发现了目标接口,它不再需要路由表入口项。RCU 允许路由查找在没有锁的情况下进行, 具有相当多的性能好处。内核中的 Startmode 无线 IP 驱动也使用 RCU 来跟踪它的设备列表。
+
+使用 RCU 的代码应当包含` <linux/rcupdate.h>`。在读这一边, 使用一个 RCU-保护的数据结构的代码应当用 `rcu_read_lock` 和`rcu_read_unlock` 调用将它的引用包含起来。结果就是, RCU 代码往往是象这样:
+
+~~~c
+struct my_stuff *stuff;
+rcu_read_lock();
+stuff = find_the_stuff(args...);
+do_something_with(stuff);
+rcu_read_unlock();
+~~~
+
+`rcu_read_lock` 调用是快的; 它禁止内核抢占但是没有等待任何东西。在读"锁"被持有时执行的代码必须是原子的。在对 `rcu_read_unlock` 调用后, 没有使用对被保护的资源的引用。需要改变被保护的结构的代码必须进行几个步骤。第一步是容易的; 它分配一个新结构,如果需要就从旧的拷贝数据, 接着替换读代码所看到的指针。在此, 对于读一边的目的,改变结束了。任何进入临界区的代码看到数据的新版本。
+
+剩下的是释放旧版本。当然, 问题是在其他处理器上运行的代码可能仍然有对旧数据的一个引用, 因此它不能立刻释放。相反, 写代码必须等待直到它知道没有这样的引用存在了。因为所有持有对这个数据结构引用的代码必须(规则规定)是原子的, 我们知道一旦系统中的每个处理器已经被调度了至少一次, 所有的引用必须消失。这就是 RCU 所做的; 它留下了一个等待直到所有处理器已经调度的回调; 那个回调接下来被运行来进行清理工作。
+
+改变一个 RCU-保护的数据结构的代码必须通过分配一个 `struct rcu_head` 来获得它的清理回调, 尽管不需要以任何方式初始化这个结构。常常, 那个结构被简单地嵌入在 RCU所保护的大的资源里面。在改变资源完成后, 应当调用:
+
+~~~c
+void call_rcu(struct rcu_head *head, void (*func)(void *arg), void *arg);
+~~~
+
+给定的 `func` 在释放资源是安全的时候调用; 传递给 `call_rcu` 的是给同一个 `arg`。常常,`func` 需要的唯一的东西是调用 `kfree`。全部 RCU 接口比我们已见的要更加复杂; 它包括, 例如, 辅助函数来使用被保护的链表。全部内容见相关的头文件。
+
+#### 补充说明
+
+> RCU（Read-Copy-Update）是一种“读不加锁、写做拷贝、延迟释放”的同步机制，适合“读非常多、写很少”的场景。
+
+---------------------
+
+**核心思想（三步走）**
+
+**1️⃣ 读（Read）**
+
+- **读者不加锁**、只需声明“我在读”
+
+```
+rcu_read_lock();
+ptr = rcu_dereference(g_ptr);
+/* 使用 ptr */
+rcu_read_unlock();
+```
+
+特点：
+
+- 几乎没有开销、不阻塞、不睡眠
+
+------
+
+2️⃣ **拷贝 + 更新（Copy + Update）**
+
+- 写者 **不在原地改**、先拷贝一份新数据、再一次性“发布”新指针
+
+```
+new = kmalloc(sizeof(*new), GFP_KERNEL);
+*new = *old;
+new->field = x;
+
+rcu_assign_pointer(g_ptr, new);
+```
+
+------
+
+3️⃣ **延迟释放（Grace Period）**
+
+- **旧数据不能立刻 free**、等所有读者退出后再释放
+
+```
+call_rcu(&old->rcu, free_func);
+```
+
+------
+
+为什么高效？
+
+| 操作 | 代价                    |
+| ---- | ----------------------- |
+| 读   | 极低（无锁）            |
+| 写   | 稍贵（拷贝 + 延迟释放） |
+
+👉 **把成本从“每次读”转移到“少量写”上**
+
+------
+
+适合什么场景？
+
+✅ 适合：
+
+- 读多写少
+- 共享只读数据
+- 配置表、路由表、连接表
+- 网络、VFS、调度器
+
+❌ 不适合：
+
+- 写非常频繁
+- 数据结构巨大（拷贝成本高）
+- 需要强事务一致性
+
+------
+
+**和传统锁的对比（直观）**
+
+| 机制     | 读       | 写     |
+| -------- | -------- | ------ |
+| mutex    | 慢       | 快     |
+| spinlock | 中       | 中     |
+| **RCU**  | **极快** | **慢** |
+
+------
+
+**最后一句总结**
+
+> **RCU 不是“更强的锁”，
+>  而是“为读优化的并发设计模式”。**
+
 
 
 ## 5.8 快速参考
 
+本章已介绍了很多符号给并发的管理. 最重要的这些在此总结:
+
+~~~c
+#include <asm/semaphore.h>
+~~~
+
+> 定义旗标和其上操作的包含文件。
+
+------------------------
+
+~~~c
+DECLARE_MUTEX(name);
+DECLARE_MUTEX_LOCKED(name);
+~~~
+
+> 2 个宏定义, 用来声明和初始化一个在互斥模式下使用的旗标。
+
+------------------------
+
+~~~c
+void init_MUTEX(struct semaphore *sem);
+void init_MUTEX_LOCKED(struct semaphore *sem);
+~~~
+
+> 这 2 函数用来在运行时初始化一个旗标。
+
+------------------------
+
+~~~c
+void down(struct semaphore *sem);
+int down_interruptible(struct semaphore *sem);
+int down_trylock(struct semaphore *sem);
+void up(struct semaphore *sem);
+~~~
+
+> 加锁和解锁旗标。down 使调用进程进入不可打断睡眠, 如果需要;down_interruptible, 相反, 可以被信号打断。down_trylock 不睡眠; 相反, 它立刻返回如果旗标不可用. 加锁旗标的代码必须最终使用 up 解锁它。
+
+------------------------
+
+~~~c
+struct rw_semaphore;
+init_rwsem(struct rw_semaphore *sem);
+~~~
+
+> 旗标的读者/写者版本和初始化它的函数。
+
+------------------------
+
+~~~c
+void down_read(struct rw_semaphore *sem);
+int down_read_trylock(struct rw_semaphore *sem);
+void up_read(struct rw_semaphore *sem);
+~~~
+
+> 获得和释放对读者/写者旗标的读存取的函数。
+
+------------------------
 
 
 ~~~c
-
+void down_write(struct rw_semaphore *sem);
+int down_write_trylock(struct rw_semaphore *sem);
+void up_write(struct rw_semaphore *sem);
+void downgrade_write(struct rw_semaphore *sem);
 ~~~
 
-> 1
+> 管理对读者/写者旗标写存取的函数。
 
 ------------------------
+
+~~~c
+#include <linux/completion.h>
+DECLARE_COMPLETION(name);
+init_completion(struct completion *c);
+INIT_COMPLETION(struct completion c);
+~~~
+
+> 描述 Linux completion 机制的包含文件, 已经初始化 completion 的正常方法。INIT_COMPLETION 应当只用来重新初始化一个之前已经使用过的 completion。
+
+------------------------
+
+~~~c
+void wait_for_completion(struct completion *c);
+~~~
+
+> 等待一个 completion 事件发出。
+
+------------------------
+
+~~~c
+void complete(struct completion *c);
+void complete_all(struct completion *c);
+~~~
+
+> 发出一个 completion 事件. completion 唤醒, 最多, 一个等待着的线程, 而complete_all 唤醒全部等待者。
+
+------------------------
+
+~~~c
+void complete_and_exit(struct completion *c, long retval);
+~~~
+
+> 通过调用 complete 来发出一个 completion 事件, 并且为当前线程调用 exit。
+
+------------------------
+
+~~~c
+#include <linux/spinlock.h>
+spinlock_t lock = SPIN_LOCK_UNLOCKED;
+spin_lock_init(spinlock_t *lock);
+~~~
+
+> 定义自旋锁接口的包含文件, 以及初始化锁的 2 个方法。
+
+------------------------
+
+~~~c
+void spin_lock(spinlock_t *lock);
+void spin_lock_irqsave(spinlock_t *lock, unsigned long flags);
+void spin_lock_irq(spinlock_t *lock);
+void spin_lock_bh(spinlock_t *lock);
+~~~
+
+> 加锁一个自旋锁的各种方法, 并且, 可能地, 禁止中断。
+
+------------------------
+
+~~~c
+void read_unlock(rwlock_t *lock);
+void read_unlock_irqrestore(rwlock_t *lock, unsigned long flags);
+void read_unlock_irq(rwlock_t *lock);
+void read_unlock_bh(rwlock_t *lock);
+~~~
+
+> 释放一个读者/写者自旋锁的读存取。
+
+------------------------
+
+~~~c
+void write_lock(rwlock_t *lock);
+void write_lock_irqsave(rwlock_t *lock, unsigned long flags);
+void write_lock_irq(rwlock_t *lock);
+void write_lock_bh(rwlock_t *lock);
+~~~
+
+> 获得一个读者/写者锁的写存取的函数。
+
+------------------------
+
+~~~c
+void write_unlock(rwlock_t *lock);
+void write_unlock_irqrestore(rwlock_t *lock, unsigned long flags);
+void write_unlock_irq(rwlock_t *lock);
+void write_unlock_bh(rwlock_t *lock);
+~~~
+
+> 释放一个读者/写者自旋锁的写存取的函数。
+
+------------------------
+
+~~~c
+#include <asm/atomic.h>
+atomic_t v = ATOMIC_INIT(value);
+void atomic_set(atomic_t *v, int i);
+int atomic_read(atomic_t *v);
+void atomic_add(int i, atomic_t *v);
+void atomic_sub(int i, atomic_t *v);
+void atomic_inc(atomic_t *v);
+void atomic_dec(atomic_t *v);
+int atomic_inc_and_test(atomic_t *v);
+int atomic_dec_and_test(atomic_t *v);
+int atomic_sub_and_test(int i, atomic_t *v);
+int atomic_add_negative(int i, atomic_t *v);
+int atomic_add_return(int i, atomic_t *v);
+int atomic_sub_return(int i, atomic_t *v);
+int atomic_inc_return(atomic_t *v);
+int atomic_dec_return(atomic_t *v);
+~~~
+
+> 原子地存取整数变量。atomic_t 变量必须只通过这些函数存取。
+
+------------------------
+
+~~~c
+#include <asm/bitops.h>
+void set_bit(nr, void *addr);
+void clear_bit(nr, void *addr);
+void change_bit(nr, void *addr);
+test_bit(nr, void *addr);
+int test_and_set_bit(nr, void *addr);
+int test_and_clear_bit(nr, void *addr);
+int test_and_change_bit(nr, void *addr);
+~~~
+
+> 原子地存取位值; 它们可用做标志或者锁变量。使用这些函数阻止任何与并发存取这个位相关的竞争情况。
+
+------------------------
+
+~~~c
+#include <linux/seqlock.h>
+seqlock_t lock = SEQLOCK_UNLOCKED;
+seqlock_init(seqlock_t *lock);
+~~~
+
+> 定义 seqlock 的包含文件, 已经初始化它们的 2 个方法。
+
+------------------------
+
+~~~c
+unsigned int read_seqbegin(seqlock_t *lock);
+unsigned int read_seqbegin_irqsave(seqlock_t *lock, unsigned long flags);
+int read_seqretry(seqlock_t *lock, unsigned int seq);
+int read_seqretry_irqrestore(seqlock_t *lock, unsigned int seq, 
+                             unsigned long flags);
+~~~
+
+> 获得一个 seqlock-保护 的资源的读权限的函数。
+
+------------------------
+
+~~~c
+void write_seqlock(seqlock_t *lock);
+void write_seqlock_irqsave(seqlock_t *lock, unsigned long flags);
+void write_seqlock_irq(seqlock_t *lock);
+void write_seqlock_bh(seqlock_t *lock);
+~~~
+
+> 获取一个 seqlock-保护的资源的写权限的函数。
+
+------------------------
+
+~~~c
+void write_sequnlock(seqlock_t *lock);
+void write_sequnlock_irqrestore(seqlock_t *lock, unsigned long flags);
+void write_sequnlock_irq(seqlock_t *lock);
+void write_sequnlock_bh(seqlock_t *lock);
+~~~
+
+> 释放一个 seqlock-保护的资源的写权限的函数。
+
+------------------------
+
+~~~c
+#include <linux/rcupdate.h>
+void rcu_read_lock;
+void rcu_read_unlock;
+~~~
+
+> 需要使用读取-拷贝-更新(RCU)机制的包含文件。
+>
+> 获取对由 RCU 保护的资源的原子读权限的宏定义。
+
+------------------------
+
+~~~c
+void call_rcu(struct rcu_head *head, void (*func)(void *arg), void *arg);
+~~~
+
+> 安排一个回调在所有处理器已经被调度以及一个 RCU-保护的资源可用被安全的释放之后运行。
+
+------------------------
+
+
+
+# END
+
+
 

@@ -13,3 +13,6 @@
 ## [第四章 调试技术](./driver_note_4.md) 
 
 ## [第五章 并发和竞争情况](./driver_note_5.md) 
+
+## [第六章 高级字符驱动操作](./driver_note_6.md) 
+
