@@ -930,7 +930,7 @@ init_waitqueue_head(&my_queue);
 
 ### 6.2.2 简单睡眠
 
-当一个进程睡眠, 它这样做以期望某些条件在以后会成真。如我们之前注意到的, 任何睡眠的进程必须在它再次醒来时检查来确保它在等待的条件真正为真。Linux 内核中睡眠的最简单方式是一个宏定义, 称为 wait_event(有几个变体); 它结合了处理睡眠的细节和进程在等待的条件的检查。wait_event 的形式是:
+当一个进程睡眠, 它这样做以期望某些条件在以后会成真。如我们之前注意到的, 任何睡眠的进程必须在它再次醒来时检查来确保它在等待的条件真正为真。Linux 内核中睡眠的最简单方式是一个宏定义, 称为 `wait_event`(有几个变体); 它结合了处理睡眠的细节和进程在等待的条件的检查。`wait_event` 的形式是:
 
 ~~~c
 wait_event(queue, condition)
@@ -952,7 +952,7 @@ void wake_up_interruptible(wait_queue_head_t *queue);
 
 `wake_up` 唤醒所有的在给定队列上等待的进程(尽管这个情形比那个要复杂一些, 如同我们之后将见到的)。其他的形式(`wake_up_interruptible`)限制它自己到处理一个可中断的睡眠。通常, 这 2 个是不用区分的(如果你使用可中断的睡眠); 实际上, 惯例是使用`wake_up` 如果你在使用 `wait_event` , `wake_up_interruptible` 如果你在使用`wait_event_interruptible`。
 
-我们现在知道足够多来看一个简单的睡眠和唤醒的例子. 在这个例子代码中, 你可找到一个称为 `sleepy` 的模块。它实现一个有简单行为的设备:任何试图从这个设备读取的进程都被置为睡眠。无论何时一个进程写这个设备, 所有的睡眠进程被唤醒。这个行为由下面的 `read` 和 `write` 方法实现:
+我们现在知道足够多来看一个简单的睡眠和唤醒的例子。在这个例子代码中, 你可找到一个称为 `sleepy` 的模块。它实现一个有简单行为的设备:任何试图从这个设备读取的进程都被置为睡眠。无论何时一个进程写这个设备, 所有的睡眠进程被唤醒。这个行为由下面的 `read` 和 `write` 方法实现:
 
 ~~~c
 static int sleepy_major = 0;
@@ -984,6 +984,2118 @@ static ssize_t sleepy_write (struct file *filp, const char __user *buf, size_t c
 注意这个例子里 flag 变量的使用。因为 wait_event_interruptible 检查一个必须变为真的条件, 我们使用 flag 来创建那个条件。
 
 有趣的是考虑当 `sleepy_write` 被调用时如果有 2 个进程在等待会发生什么。因为`sleepy_read` 重置 `flag` 为 0 一旦它醒来, 你可能认为醒来的第 2 个进程会立刻回到睡眠。在一个单处理器系统, 这几乎一直是发生的事情。但是重要的是要理解为什么你不能依赖这个行为。`wake_up_interruptible` 调用将使 2 个睡眠进程醒来。完全可能它们都注意到 flag 是非零, 在另一个有机会重置它之前。对于这个小模块, 这个竞争条件是不重要的。在一个真实的驱动中, 这种竞争可能导致少见的难于查找的崩溃。如果正确的操作要求只能有一个进程看到这个非零值, 它将必须以原子的方式被测试。我们将见到一个真正的驱动如何处理这样的情况。但首先我们必须开始另一个主题。
+
+
+
+### 6.2.3 阻塞和非阻塞操作
+
+在我们看全功能的 `read` 和 `write` 方法的实现之前, 我们触及的最后一点是决定何时使进程睡眠。有时实现正确的 unix 语义要求一个操作不阻塞, 即便它不能完全地进行下去。有时还有调用进程通知你他不想阻塞, 不管它的 `I/O` 是否继续。明确的非阻塞 `I/O` 由`filp->f_flags` 中的 `O_NONBLOCK` 标志来指示。这个标志定义于`<linux/fcntl.h>`, 被`<linux/fs.h>`自动包含。这个标志得名自"打开-非阻塞", 因为它可在打开时指定(并且起初只能在那里指定)。如果你浏览源码, 你会发现一些对一个 `O_NDELAY` 标志的引用; 这是一个替代 `O_NONBLOCK` 的名子, 为兼容 System V 代码而被接受的。这个标志缺省地被清除, 因为一个等待数据的进程的正常行为仅仅是睡眠。在一个阻塞操作的情况下, 这是缺省地, 下列的行为应当实现来符合标准语法:
+
+* 如果一个进程调用 read 但是没有数据可用(尚未), 这个进程必须阻塞。这个进程在有数据达到时被立刻唤醒, 并且那个数据被返回给调用者, 即便小于在给方法的count 参数中请求的数量。
+* 如果一个进程调用 write 并且在缓冲中没有空间, 这个进程必须阻塞, 并且它必须在一个与用作 read 的不同的等待队列中。当一些数据被写入硬件设备, 并且在输出缓冲中的空间变空闲, 这个进程被唤醒并且写调用成功, 尽管数据可能只被部分写入如果在缓冲只没有空间给被请求的 count 字节。
+
+这 2 句都假定有输入和输出缓冲; 实际上, 几乎每个设备驱动都有。要求有输入缓冲是为了避免丢失到达的数据, 当无人在读时。相反, 数据在写时不能丢失, 因为如果系统调用不能接收数据字节, 它们保留在用户空间缓冲。即便如此, 输出缓冲几乎一直有用, 对于从硬件挤出更多的性能。
+
+在驱动中实现输出缓冲所获得的性能来自减少了上下文切换和用户级/内核级切换的次数。没有一个输出缓冲(假定一个慢速设备), 每次系统调用接收这样一个或几个字符, 并且当一个进程在 `write` 中睡眠, 另一个进程运行(那是一次上下文切换)。当第一个进程被唤醒, 它恢复(另一次上下文切换), 写返回(内核/用户转换), 并且这个进程重新发出系统调用来写入更多的数据(用户/内核转换); 这个调用阻塞并且循环继续。增加一个输出缓冲可允许驱动在每个写调用中接收大的数据块, 性能上有相应的提高。如果这个缓冲足够大, 写调用在第一次尝试就成功 -- 被缓冲的数据之后将被推到设备 -- 不必控制需要返回用户空间来第二次或者第三次写调用。选择一个合适的值给输出缓冲显然是设备特定的。
+
+我们不使用一个输入缓冲在 scull 中, 因为数据当发出 read 时已经可用。类似的, 不用输出缓冲, 因为数据被简单地拷贝到和设备关联的内存区。本质上, 这个设备是一个缓冲,因此额外缓冲的实现可能是多余的。我们将在第 10 章见到缓冲的使用。
+
+如果指定 `O_NONBLOCK`, `read` 和 `write` 的行为是不同的。在这个情况下, 这个调用简单地返回 `-EAGAIN`("try it agin")如果一个进程当没有数据可用时调用 `read `, 或者如果当缓冲中没有空间时它调用 `write`。
+
+如你可能期望的, 非阻塞操作立刻返回, 允许这个应用程序轮询数据。应用程序当使用stdio 函数处理非阻塞文件中, 必须小心, 因为它们容易搞错一个的非阻塞返回为 `EOF`。它们始终必须检查 `errno`。
+
+自然地, `O_NONBLOCK` 也在 `open` 方法中有意义。这个发生在当这个调用真正阻塞长时间时; 例如, 当打开(为读存取)一个 没有写者的(尚无)`FIFO`, 或者存取一个磁盘文件使用一个悬挂锁。常常地, 打开一个设备或者成功或者失败, 没有必要等待外部的事件。有时,但是, 打开这个设备需要一个长的初始化, 并且你可能选择在你的 `open` 方法中支持`O_NONBLOCK` , 通过立刻返回 `-EAGAIN`,如果这个标志被设置。在开始这个设备的初始化进程之后。这个驱动可能还实现一个阻塞 `open` 来支持存取策略, 通过类似于文件锁的方式。我们将见到这样一个实现在"阻塞 `open` 作为对 `EBUSY` 的替代"一节, 在本章后面。
+
+一些驱动可能还实现特别的语义给 `O_NONBLOCK`; 例如, 一个磁带设备的 `open` 常常阻塞直到插入一个磁带。如果这个磁带驱动器使用 `O_NONBLOCK` 打开, 这个 `open` 立刻成功,不管是否介质在或不在。
+
+**只有 `read`, `write` 和 `open` 文件操作受到非阻塞标志影响。**
+
+
+
+### 6.2.4 一个阻塞 I/O 的例子
+
+最后, 我们看一个实现了阻塞 `I/O` 的真实驱动方法的例子。这个例子来自 `scullpipe` 驱动; 它是 scull 的一个特殊形式, 实现了一个象管道的设备。
+
+在驱动中, 一个阻塞在读调用上的进程被唤醒, 当数据到达时; 常常地硬件发出一个中断来指示这样一个事件, 并且驱动唤醒等待的进程作为处理这个中断的一部分。`scullpipe`驱动不同, 以至于它可运行而不需要任何特殊的硬件或者一个中断处理。我们选择来使用另一个进程来产生数据并唤醒读进程; 类似地, 读进程被用来唤醒正在等待缓冲空间可用的写者进程。
+
+这个设备驱动使用一个设备结构, 它包含 2 个等待队列和一个缓冲。缓冲大小是以常用的方法可配置的(在编译时间, 加载时间, 或者运行时间)。
+
+~~~c
+// ldd3-master/scull/pipe.c
+#include "scull.h"		/* local definitions */
+
+struct scull_pipe {
+        wait_queue_head_t inq, outq;       /* read and write queues */
+        char *buffer, *end;                /* begin of buf, end of buf */
+        int buffersize;                    /* used in pointer arithmetic */
+        char *rp, *wp;                     /* where to read, where to write */
+        int nreaders, nwriters;            /* number of openings for r/w */
+        struct fasync_struct *async_queue; /* asynchronous readers */
+        struct mutex lock;              /* mutual exclusion mutex */
+        struct cdev cdev;                  /* Char device structure */
+};
+~~~
+
+读实现既管理阻塞也管理非阻塞输入, 看来如此:
+
+~~~c
+/*
+ * Data management: read and write
+ */
+
+static ssize_t scull_p_read (struct file *filp, char __user *buf, size_t count,
+                loff_t *f_pos)
+{
+	struct scull_pipe *dev = filp->private_data;
+
+	if (mutex_lock_interruptible(&dev->lock))
+		return -ERESTARTSYS;
+
+	while (dev->rp == dev->wp) { /* nothing to read */
+		mutex_unlock(&dev->lock); /* release the lock */
+		if (filp->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		PDEBUG("\"%s\" reading: going to sleep\n", current->comm);
+		if (wait_event_interruptible(dev->inq, (dev->rp != dev->wp)))
+			return -ERESTARTSYS; /* signal: tell the fs layer to handle it */
+		/* otherwise loop, but first reacquire the lock */
+		if (mutex_lock_interruptible(&dev->lock))
+			return -ERESTARTSYS;
+	}
+	/* ok, data is there, return something */
+	if (dev->wp > dev->rp)
+		count = min(count, (size_t)(dev->wp - dev->rp));
+	else /* the write pointer has wrapped, return data up to dev->end */
+		count = min(count, (size_t)(dev->end - dev->rp));
+	if (copy_to_user(buf, dev->rp, count)) {
+		mutex_unlock (&dev->lock);
+		return -EFAULT;
+	}
+	dev->rp += count;
+	if (dev->rp == dev->end)
+		dev->rp = dev->buffer; /* wrapped */
+	mutex_unlock (&dev->lock);
+
+	/* finally, awake any writers and return */
+	wake_up_interruptible(&dev->outq);
+	PDEBUG("\"%s\" did read %li bytes\n",current->comm, (long)count);
+	return count;
+}
+~~~
+
+如同你可见的, 我们在代码中留有一些 `PDEBUG` 语句。当你编译这个驱动, 你可使能消息机制来易于跟随不同进程间的交互。
+
+让我们仔细看看 `scull_p_read` 如何处理对数据的等待。这个 `while` 循环在持有设备旗标下测试这个缓冲。如果有数据在那里, 我们知道我们可立刻返回给用户, 不必睡眠, 因此整个循环被跳过。 相反, 如果这个缓冲是空的, 我们必须睡眠。但是在我们可做这个之前, 我们必须丢掉设备旗标（**现代linux中使用的时锁，后续不再纠正**）; 如果我们要持有它而睡眠, 就不会有写者有机会唤醒我们。一旦这个确保被丢掉, 我们做一个快速检查来看是否用户已请求非阻塞 `I/O`, 并且如果是这样就返回。否则, 是时间调用 `wait_event_interruptible`。
+
+一旦我们过了这个调用, 某些东西已经唤醒了我们, 但是我们不知道是什么。一个可能是进程接收到了一个信号。包含 `wait_event_interruptible` 调用的这个 `if` 语句检查这种情况。这个语句保证了正确的和被期望的对信号的反应, 它可能负责唤醒这个进程(因为我们处于一个可中断的睡眠)。如果一个信号已经到达并且它没有被这个进程阻塞, 正确的做法是让内核的上层处理这个事件。到此, 这个驱动返回 `-ERESTARTSYS` 到调用者; 这个值被虚拟文件系统(VFS)在内部使用, 它或者重启系统调用或者返回 `-EINTR` 给用户空间。我们使用相同类型的检查来处理信号, 给每个读和写实现。
+
+但是, 即便没有一个信号, 我们还是不确切知道有数据在那里为获取。其他人也可能已经在等待数据, 并且它们可能赢得竞争并且首先得到数据。因此我们必须再次获取设备旗标;只有这时我们才可以测试读缓冲(在 `while` 循环中)并且真正知道我们可以返回缓冲中的数据给用户。全部这个代码的最终结果是, 当我们从 `while` 循环中退出时, 我们知道旗标被获得并且缓冲中有数据我们可以用。
+
+仅仅为了完整, 我们要注意, `scull_p_read` 可以在另一个地方睡眠, 在我们获得设备旗标之后: 对 `copy_to_user` 的调用。如果 scull 当在内核和用户空间之间拷贝数据时睡眠, 它在持有设备旗标中睡眠。在这种情况下持有旗标是合理的因为它不能死锁系统(我们知道内核将进行拷贝到用户空间并且在不加锁进程中的同一个旗标下唤醒我们), 并且因为重要的是设备内存数组在驱动睡眠时不改变。
+
+#### 函数补充解释
+
+这段代码是 **scull_pipe 的 `read()` 实现**，本质是：
+
+> **在内核里实现了一个“带阻塞语义的环形缓冲区读”**
+
+------
+
+**一、整体模型（先有全局认识）**
+
+`struct scull_pipe` 里核心成员一般是：
+
+```
+char *buffer;   // 缓冲区起始
+char *end;      // buffer + size
+char *rp;       // read pointer
+char *wp;       // write pointer
+
+struct mutex lock;
+wait_queue_head_t inq;   // 读等待队列
+wait_queue_head_t outq;  // 写等待队列
+```
+
+逻辑关系：
+
+```
+buffer                    end
+  |------------------------|
+  ^            ^
+  rp           wp
+```
+
+- **rp == wp** → 缓冲区空
+- **wp > rp** → 连续数据
+- **wp < rp** → 写指针已经回绕（wrap）
+
+------
+
+**二、函数入口：拿到设备并加锁**
+
+```
+struct scull_pipe *dev = filp->private_data;
+
+if (mutex_lock_interruptible(&dev->lock))
+    return -ERESTARTSYS;
+```
+
+**关键点**
+
+- `filp->private_data` 在 `open()` 里设置
+- 使用 **mutex 而不是 spinlock**
+  - 因为下面会 **sleep**
+- `mutex_lock_interruptible`：
+  - 如果在等锁时收到信号 → 返回 `-ERESTARTSYS`
+
+------
+
+**三、核心循环：缓冲区空 → 要不要阻塞？**
+
+```
+while (dev->rp == dev->wp) { /* nothing to read */
+```
+
+**1️⃣ 缓冲区为空**
+
+**先解锁（非常重要）**
+
+```
+mutex_unlock(&dev->lock);
+```
+
+> **睡眠前必须释放锁**
+>  否则写进程永远拿不到锁，死锁。
+
+------
+
+**2️⃣ 非阻塞读？直接返回**
+
+```
+if (filp->f_flags & O_NONBLOCK)
+    return -EAGAIN;
+```
+
+用户态行为：
+
+```
+fd = open("/dev/scullpipe", O_RDONLY | O_NONBLOCK);
+read(fd, buf, 100);  // 立刻返回 -EAGAIN
+```
+
+------
+
+**3️⃣ 阻塞读：睡眠等待数据**
+
+```
+wait_event_interruptible(dev->inq, (dev->rp != dev->wp))
+```
+
+含义是：
+
+> 把当前进程挂到 **inq 等待队列**，直到：
+>
+> - 条件成立：`rp != wp`
+> - 或被信号打断
+
+**等价伪代码：**
+
+```
+while (rp == wp) {
+    sleep_on(inq);
+}
+```
+
+**被信号打断？**
+
+```
+return -ERESTARTSYS;
+```
+
+让 VFS 决定：**重启系统调用**或**向用户返回 `EINTR`**。
+
+------
+
+**4️⃣ 被唤醒后，重新加锁再检查**
+
+```
+if (mutex_lock_interruptible(&dev->lock))
+    return -ERESTARTSYS;
+```
+
+> **典型“sleep → wake → recheck”模式**
+
+因为：
+
+- wake_up ≠ 条件一定成立
+- 必须 while 重新检查
+
+------
+
+**四、真正开始读数据（核心逻辑）**
+
+跳出 `while`，说明：
+
+```
+rp != wp   // 至少有 1 字节可读
+```
+
+------
+
+**1️⃣ 计算本次最多能读多少**
+
+**情况 A：没有回绕**
+
+```
+if (dev->wp > dev->rp)
+    count = min(count, dev->wp - dev->rp);
+buffer
+|----rp======wp----|
+```
+
+最多只能读到 `wp`
+
+------
+
+**情况 B：写指针已回绕**
+
+```
+else
+    count = min(count, dev->end - dev->rp);
+buffer
+|===wp----rp======end|
+```
+
+只能先读到 `end`
+
+------
+
+**2️⃣ 拷贝到用户空间**
+
+```
+if (copy_to_user(buf, dev->rp, count)) {
+    mutex_unlock(&dev->lock);
+    return -EFAULT;
+}
+```
+
+- 内核 → 用户
+- 用户指针非法 → `-EFAULT`
+
+------
+
+**3️⃣ 推进读指针 rp**
+
+```
+dev->rp += count;
+
+if (dev->rp == dev->end)
+    dev->rp = dev->buffer;
+```
+
+完成一次“消费”：
+
+```
+rp ----> rp + count
+```
+
+如果到末尾 → 回绕
+
+------
+
+**五、收尾：解锁 + 唤醒写者**
+
+```
+mutex_unlock(&dev->lock);
+```
+
+**唤醒写进程**
+
+```
+wake_up_interruptible(&dev->outq);
+```
+
+为什么？写进程可能在：
+
+```
+while (space == 0)
+    wait_event(outq, space > 0);
+```
+
+> **读释放空间 → 写可以继续**
+
+------
+
+**六、完整时序图（ASCII）**
+
+**阻塞读 + 写唤醒**
+
+```
+Reader                  Kernel                  Writer
+  | read()                |                       |
+  | lock                  |                       |
+  | rp == wp              |                       |
+  | unlock                |                       |
+  | sleep on inq -------->|                       |
+  |                       | write data            |
+  |                       | wp advances           |
+  |                       | wake_up(inq) ---------|
+  | <---------------------|                       |
+  | lock                  |                       |
+  | copy_to_user          |                       |
+  | rp advances           |                       |
+  | unlock                |                       |
+  | wake_up(outq) ------->|                       |
+```
+
+------
+
+**七、这段代码的设计特点（你会关心的）**
+
+**✅ 优点**
+
+- 逻辑清晰
+- 完整支持：阻塞 / 非阻塞、信号打断
+- 经典 Linux 教科书级写法
+
+**❌ 缺点**
+
+- mutex + wait queue → **不适合高频路径**
+- 单 reader / writer（本质 SPSC）
+- 没有 cacheline / false sharing 优化
+
+------
+
+> `scull_p_read()` 做的事就是：
+>  **“如果没数据就睡，有数据就按环形缓冲区规则拷贝，读完推进 rp，并唤醒写者”**
+
+
+
+### 6.2.5 高级睡眠
+
+许多驱动能够满足它们的睡眠要求, 使用至今我们已涉及到的函数。但是, 有时需要深入理解 Linux 等待队列机制如何工作。复杂的加锁或者性能需要可强制一个驱动来使用低层函数来影响一个睡眠。在本节, 我们在低层看而理解在一个进程睡眠时发生了什么。
+
+#### 6.2.5.1 一个进程如何睡眠
+
+如果我们深入 `<linux/wait.h>`, 你见到在 `wait_queue_head_t` 类型后面的数据结构是非常简单的; 它包含一个自旋锁和一个链表。这个链表是一个等待队列入口, 它被声明做`wait_queue_t`。这个结构包含关于睡眠进程的信息和它想怎样被唤醒。
+
+使一个进程睡眠的第一步常常是分配和初始化一个 ``````wait_queue_t`````` 结构, 随后将其添加到正确的等待队列。当所有东西都就位了, 负责唤醒工作的人就可以找到正确的进程。
+
+下一步是设置进程的状态来标志它为睡眠。在 `<linux/sched.h>` 中定义有几个任务状态。`TASK_RUNNING` 意思是进程能够运行, 尽管不必在任何特定的时刻在处理器上运行。有 2个状态指示一个进程是在睡眠: `ASK_INTERRUPTIBLE` 和 `TASK_UNTINTERRUPTIBLE`; 当然,它们对应 2 类的睡眠。其他的状态正常地和驱动编写者无关。在 2.6 内核, 对于驱动代码通常不需要直接操作进程状态. 但是, 如果你需要这样做,使用的代码是:
+
+~~~c
+void set_current_state(int new_state);
+~~~
+
+在老的代码中, 你常常见到如此的东西:
+
+~~~c
+current->state = TASK_INTERRUPTIBLE;
+~~~
+
+但是象这样直接改变 current 是不鼓励的; 当数据结构改变时这样的代码会轻易地失效。但是, 上面的代码确实展示了自己改变一个进程的当前状态不能使其睡眠。通过改变current 状态, 你已改变了调度器对待进程的方式, 但是你还未让出处理器。
+
+放弃处理器是最后一步, 但是要首先做一件事: 你必须先检查你在睡眠的条件。做这个检查失败会引入一个竞争条件; 如果在你忙于上面的这个过程并且有其他的线程刚刚试图唤醒你, 如果这个条件变为真会发生什么? 你可能错过唤醒并且睡眠超过你预想的时间。因此, 在睡眠的代码下面, 典型地你会见到下面的代码:
+
+~~~c
+if (!condition)
+	schedule();
+~~~
+
+通过在设置了进程状态后检查我们的条件, 我们涵盖了所有的可能的事件进展。如果我们在等待的条件已经在设置进程状态之前到来, 我们在这个检查中注意到并且不真正地睡眠。如果之后发生了唤醒, 进程被置为可运行的不管是否我们已真正进入睡眠。
+
+调用 `schedule` , 当然, 是引用调度器和让出 CPU 的方式。无论何时你调用这个函数,你是在告诉内核来考虑应当运行哪个进程并且转换控制到那个进程, 如果必要。因此你从不知道在 `schedule` 返回到你的代码会是多长时间。
+
+在 if 测试和可能的调用 `schedule` (并从其返回)之后, 有些清理工作要做。因为这个代码不再想睡眠, 它必须保证任务状态被重置为 `TASK_RUNNING`。如果代码只是从 `schedule`返回, 这一步是不必要的; 那个函数不会返回直到进程处于可运行态。如果由于不再需要睡眠而对 `schedule` 的调用被跳过, 进程状态将不正确. 还有必要从等待队列中去除这个进程, 否则它可能被多次唤醒。
+
+
+
+#### 6.2.5.2 手动睡眠
+
+在 Linux 内核的之前的版本, 正式的睡眠要求程序员手动处理所有上面的步骤。它是一个繁琐的过程, 包含相当多的易出错的样板式的代码。程序员如果愿意还是可能用那种方式手动睡眠; <linux/sched.h> 包含了所有需要的定义, 以及围绕例子的内核源码。但是,有一个更容易的方式。
+
+第一步是创建和初始化一个等待队列。这常常由这个宏定义完成:
+
+~~~c
+DEFINE_WAIT(my_wait);
+~~~
+
+其中, `name` 是等待队列入口项的名子。你可用 2 步来做:
+
+~~~c
+wait_queue_t my_wait;
+init_wait(&my_wait);
+~~~
+
+但是常常更容易的做法是放一个 `DEFINE_WAIT` 行在循环的顶部, 来实现你的睡眠。
+
+下一步是添加你的等待队列入口到队列, 并且设置进程状态。2 个任务都由这个函数处理:
+
+~~~c
+void prepare_to_wait(wait_queue_head_t *queue, wait_queue_t *wait, int state);
+~~~
+
+这里, `queue` 和 `wait` 分别地是等待队列头和进程入口。`state` 是进程的新状态; 它应当或者是 `TASK_INTERRUPTIBLE`(给可中断的睡眠, 这常常是你所要的)或者`TASK_UNINTERRUPTIBLE`(给不可中断睡眠)。
+
+在调用 `prepare_to_wait` 之后, 进程可调用 `schedule` -- 在它已检查确认它仍然需要等待之后。一旦 `schedule` 返回, 就到了清理时间。这个任务, 也, 被一个特殊的函数处理:
+
+~~~c
+void finish_wait(wait_queue_head_t *queue, wait_queue_t *wait);
+~~~
+
+之后, 你的代码可测试它的状态并且看是否它需要再次等待。
+
+我们早该需要一个例子了。之前我们看了 给 scullpipe 的 `read` 方法, 它使用`wait_event`。同一个驱动中的 `write` 方法使用 `prepare_to_wait` 和 `finish_wait` 来实现它的等待。正常地, 你不会在一个驱动中象这样混用各种方法, 但是我们这样作是为了能够展示 2 种处理睡眠的方式.为完整起见。首先, 我们看 write 方法本身:
+
+~~~c
+/* How much space is free? */
+static int spacefree(struct scull_pipe *dev)
+{
+	if (dev->rp == dev->wp)
+		return dev->buffersize - 1;
+	return ((dev->rp + dev->buffersize - dev->wp) % dev->buffersize) - 1;
+}
+
+static ssize_t scull_p_write(struct file *filp, const char __user *buf, size_t count,
+                loff_t *f_pos)
+{
+	struct scull_pipe *dev = filp->private_data;
+	int result;
+
+	if (mutex_lock_interruptible(&dev->lock))
+		return -ERESTARTSYS;
+
+	/* Make sure there's space to write */
+	result = scull_getwritespace(dev, filp);
+	if (result)
+		return result; /* scull_getwritespace called up(&dev->sem) */
+
+	/* ok, space is there, accept something */
+	count = min(count, (size_t)spacefree(dev));
+	if (dev->wp >= dev->rp)
+		count = min(count, (size_t)(dev->end - dev->wp)); /* to end-of-buf */
+	else /* the write pointer has wrapped, fill up to rp-1 */
+		count = min(count, (size_t)(dev->rp - dev->wp - 1));
+	PDEBUG("Going to accept %li bytes to %p from %p\n", (long)count, dev->wp, buf);
+	if (copy_from_user(dev->wp, buf, count)) {
+		mutex_unlock(&dev->lock);
+		return -EFAULT;
+	}
+	dev->wp += count;
+	if (dev->wp == dev->end)
+		dev->wp = dev->buffer; /* wrapped */
+	mutex_unlock(&dev->lock);
+
+	/* finally, awake any reader */
+	wake_up_interruptible(&dev->inq);  /* blocked in read() and select() */
+
+	/* and signal asynchronous readers, explained late in chapter 5 */
+	if (dev->async_queue)
+		kill_fasync(&dev->async_queue, SIGIO, POLL_IN);
+	PDEBUG("\"%s\" did write %li bytes\n",current->comm, (long)count);
+	return count;
+}
+~~~
+
+这个代码看来和 `read`方法类似, 除了我们已经将睡眠代码放到了一个单独的函数, 称为`scull_getwritespace`。它的工作是确保在缓冲中有空间给新的数据, 睡眠直到有空间可用。一旦空间在, `scull_p_write` 可简单地拷贝用户的数据到那里, 调整指针, 并且唤醒可能已经在等待读取数据的进程。处理实际的睡眠的代码是:
+
+~~~c
+/* Wait for space for writing; caller must hold device semaphore.  On
+ * error the semaphore will be released before returning. */
+static int scull_getwritespace(struct scull_pipe *dev, struct file *filp)
+{
+	while (spacefree(dev) == 0) { /* full */
+		DEFINE_WAIT(wait);
+		
+		mutex_unlock(&dev->lock);
+		if (filp->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		PDEBUG("\"%s\" writing: going to sleep\n",current->comm);
+		prepare_to_wait(&dev->outq, &wait, TASK_INTERRUPTIBLE);
+		if (spacefree(dev) == 0)
+			schedule();
+		finish_wait(&dev->outq, &wait);
+		if (signal_pending(current))
+			return -ERESTARTSYS; /* signal: tell the fs layer to handle it */
+		if (mutex_lock_interruptible(&dev->lock))
+			return -ERESTARTSYS;
+	}
+	return 0;
+}	
+~~~
+
+再次注意 `while` 循环。如果有空间可用而不必睡眠, 这个函数简单地返回。否则, 它必须丢掉设备旗标并且等待。这个代码使用 `DEFINE_WAIT` 来设置一个等待队列入口并且`prepare_to_wait` 来准备好实际的睡眠。接着是对缓冲的必要的检查; 我们必须处理的情况是在我们已经进入 `while` 循环后以及在我们将自己放入等待队列之前 (并且丢弃了旗标), 缓冲中有空间可用了。没有这个检查, 如果读进程能够在那时完全清空缓冲, 我们可能错过我们能得到的唯一的唤醒并且永远睡眠。在说服我们自己必须睡眠之后, 我们调用 `schedule`。
+
+值得再看看这个情况: 当睡眠发生在 `if` 语句测试和调用 `schedule` 之间, 会发生什么?在这个情况里。这个唤醒重置了进程状态为 `TASK_RUNNING` 并且 `schedule` 返回, 尽管不必马上。只要这个测试发生在进程放置自己到等待队列和改变它的状态之后, 事情都会顺利。
+
+为了结束, 我们调用 `finish_wait`. 对 `signal_pending` 的调用告诉我们是否我们被一个信号唤醒; 如果是, 我们需要返回到用户并且使它们稍后再试。否则, 我们请求旗标, 并且再次照常测试空闲空间。
+
+
+
+#### 6.2.5.3 互斥等待
+
+我们已经见到当一个进程调用 `wake_up` 在等待队列上, 所有的在这个队列上等待的进程被置为可运行的。在许多情况下, 这是正确的做法。但是, 在别的情况下, 可能提前知道只有一个被唤醒的进程将成功获得需要的资源, 并且其余的将简单地再次睡眠。每个这样的进程, 但是, 必须获得处理器, 竞争资源(和任何的管理用的锁), 并且明确地回到睡眠。如果在等待队列中的进程数目大, 这个"惊群"行为可能严重降低系统的性能。
+
+为应对实际世界中的惊群问题, 内核开发者增加了一个"互斥等待"选项到内核中。一个互斥等待的行为非常象一个正常的睡眠, 有 2 个重要的不同:
+
+* 当一个等待队列入口有 `WQ_FLAG_EXCLUSEVE` 标志置位, 它被添加到等待队列的尾部。没有这个标志的入口项, 相反, 添加到开始。
+*  当 `wake_up` 被在一个等待队列上调用, 它在唤醒第一个有 `WQ_FLAG_EXCLUSIVE` 标志的进程后停止。
+
+最后的结果是进行互斥等待的进程被一次唤醒一个, 以顺序的方式, 并且没有引起惊群问题。但内核仍然每次唤醒所有的非互斥等待者。
+
+在驱动中采用互斥等待是要考虑的, 如果满足 2 个条件: 你希望对资源的有效竞争, 并且唤醒一个进程就足够来完全消耗资源当资源可用时。互斥等待对 Apacheweb 服务器工作地很好。例如; 当一个新连接进入, 确实地系统中的一个 Apache 进程应当被唤醒来处理它。我们在 scullpipe 驱动中不使用互斥等待, 但是; 很少见到竞争数据的读者(或者竞争缓冲空间的写者), 并且我们无法知道一个读者, 一旦被唤醒, 将消耗所有的可用数据。
+
+使一个进程进入可中断的等待, 是调用 `prepare_to_wait_exclusive` 的简单事情:
+
+~~~c
+void prepare_to_wait_exclusive(wait_queue_head_t *queue, 
+                               wait_queue_t *wait, int state);
+~~~
+
+这个调用, 当用来代替 `prepare_to_wait`, 设置"互斥"标志在等待队列入口项并且添加这个进程到等待队列的尾部。注意没有办法使用 `wait_event` 和它的变体来进行互斥等待。
+
+
+
+#### 6.2.5.4 唤醒的细节
+
+我们已展现的唤醒进程的样子比内核中真正发生的要简单。当进程被唤醒时产生的真正动作是被位于等待队列入口项的一个函数控制的。缺省的唤醒函数设置进程为可运行的状态, 并且可能地进行一个上下文切换到有更高优先级进程。设备驱动应当从不需要提供一个不同的唤醒函数; 如果你例外, 关于如何做的信息见` <linux/wait.h>`。
+
+我们尚未看到所有的 `wake_up` 变体。大部分驱动编写者从不需要其他的, 但是, 为完整起见, 这里是整个集合:
+
+~~~c
+wake_up(wait_queue_head_t *queue);
+wake_up_interruptible(wait_queue_head_t *queue);
+~~~
+
+> `wake_up` 唤醒队列中的每个不是在互斥等待中的进程, 并且就只一个互斥等待者,如果它存在。`wake_up_interruptible` 同样, 除了它跳过处于不可中断睡眠的进程。这些函数, 在返回之前, 使一个或多个进程被唤醒来被调度(尽管如果它们被从一个原子上下文调用, 这就不会发生)。
+
+------
+
+~~~c
+wake_up_nr(wait_queue_head_t *queue, int nr);
+wake_up_interruptible_nr(wait_queue_head_t *queue, int nr);
+~~~
+
+> 这些函数类似 `wake_up`, 除了它们能够唤醒多达 `nr` 个互斥等待者, 而不只是一个。注意传递 0 被解释为请求所有的互斥等待者都被唤醒, 而不是一个没有。
+
+------------------------
+
+~~~c
+wake_up_all(wait_queue_head_t *queue);
+wake_up_interruptible_all(wait_queue_head_t *queue);
+~~~
+
+> 这种 `wake_up` 唤醒所有的进程, 不管它们是否进行互斥等待(尽管可中断的类型仍然跳过在做不可中断等待的进程)。
+
+------------------------
+
+~~~c
+wake_up_interruptible_sync(wait_queue_head_t *queue);
+~~~
+
+> 正常地, 一个被唤醒的进程可能抢占当前进程, 并且在 `wake_up` 返回之前被调度到处理器。换句话说, 调用 `wake_up` 可能不是原子的。如果调用 `wake_up` 的进程运行在原子上下文(它可能持有一个自旋锁, 例如, 或者是一个中断处理), 这个重调度不会发生。正常地, 那个保护是足够的。但是, 如果你需要明确要求不要被调度出处理器在那时, 你可以使用 `wake_up_interruptible` 的"同步"变体。这个函数最常用在当调用者要无论如何重新调度, 并且它会更有效的来首先简单地完成剩下的任何小的工作。
+
+------------------------
+
+如果上面的全部内容在第一次阅读时没有完全清楚, 不必担心. 很少请求会需要调用`wake_up_interruptible` 之外的。
+
+#### 6.2.5.5 以前的历史: sleep_on
+
+如果你花些时间深入内核源码, 你可能遇到我们到目前忽略讨论的 2 个函数:
+
+~~~c
+void sleep_on(wait_queue_head_t *queue);
+void interruptible_sleep_on(wait_queue_head_t *queue);
+~~~
+
+如你可能期望的, 这些函数无条件地使当前进程睡眠在给定队列尚。这些函数强烈不推荐,但是, 并且你应当从不使用它们。如果你想想它则问题是明显的: `sleep_on` 没提供方法来避免竞争条件。常常有一个窗口在当你的代码决定它必须睡眠时和当 `sleep_on` 真正影响到睡眠时。在那个窗口期间到达的唤醒被错过。因此, 调用 `sleep_on` 的代码从不是完全安全的。
+
+当前计划对 `sleep_on` 和 它的变体的调用(有多个我们尚未展示的超时的类型)在不太远的将来从内核中去掉。
+
+
+
+### 6.2.6 测试 scullpipe 驱动
+
+我们已经见到了 scullpipe 驱动如何实现阻塞 `I/O`。如果你想试一试, 这个驱动的源码可在剩下的本书例子中找到。阻塞 `I/O` 的动作可通过打开 2 个窗口见到。第一个可运行一个命令诸如 `cat /dev/scullpipe`。如果你接着, 在另一个窗口拷贝文件到`/dev/scullpipe`, 你可见到文件的内容出现在第一个窗口。
+
+~~~c
+/*
+ * nbtest.c: read and write in non-blocking mode
+ * This should run with any Unix
+ *
+ * Copyright (C) 2001 Alessandro Rubini and Jonathan Corbet
+ * Copyright (C) 2001 O'Reilly & Associates
+ *
+ * The source code in this file can be freely used, adapted,
+ * and redistributed in source or binary form, so long as an
+ * acknowledgment appears in derived source files.  The citation
+ * should list that the code comes from the book "Linux Device
+ * Drivers" by Alessandro Rubini and Jonathan Corbet, published
+ * by O'Reilly & Associates.   No warranty is attached;
+ * we cannot take responsibility for errors or fitness for use.
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <errno.h>
+
+char buffer[4096];
+
+int main(int argc, char **argv)
+{
+	int delay = 1, n, m = 0;
+
+	if (argc > 1)
+		delay=atoi(argv[1]);
+	fcntl(0, F_SETFL, fcntl(0,F_GETFL) | O_NONBLOCK); /* stdin */
+	fcntl(1, F_SETFL, fcntl(1,F_GETFL) | O_NONBLOCK); /* stdout */
+
+	while (1) {
+		n = read(0, buffer, 4096);
+		if (n >= 0)
+			m = write(1, buffer, n);
+		if ((n < 0 || m < 0) && (errno != EAGAIN))
+			break;
+		sleep(delay);
+	}
+	perror(n < 0 ? "stdin" : "stdout");
+	exit(1);
+}
+
+~~~
+
+如果你在一个进程跟踪工具, 如 strace 下运行这个程序, 你可见到每个操作的成功或者失败, 依赖是否当进行操作时有数据可用。
+
+#### 测试说明补充
+
+**一、这段程序在干什么（先看清本质）**
+
+**1️⃣ 核心行为**
+
+```
+fcntl(0, F_SETFL, fcntl(0,F_GETFL) | O_NONBLOCK);
+fcntl(1, F_SETFL, fcntl(1,F_GETFL) | O_NONBLOCK);
+```
+
+👉 把 **stdin / stdout 都设成非阻塞**
+
+主循环：
+
+```
+n = read(0, buffer, 4096);   // 非阻塞读 stdin
+m = write(1, buffer, n);    // 非阻塞写 stdout
+```
+
+- 如果没数据 → `read()` 返回 `-1 + EAGAIN`
+- 如果对端满 → `write()` 返回 `-1 + EAGAIN`
+- **EAGAIN 被“吞掉”，程序继续跑**
+- 其他错误 → 退出
+
+**2️⃣ 本质作用**
+
+> **在两个“可能阻塞的文件描述符”之间搬运数据**
+>  并且**验证它们是否正确返回 EAGAIN**
+
+------
+
+**二、测试 scull_pipe 的关键点**
+
+👉 **不需要改源码，只需要重定向 stdin / stdout**
+
+scullpipe 是什么？
+
+- `/dev/scullpipe0`
+- 一个 **字符设备**
+- 实现了：**阻塞 read/write、非阻塞 O_NONBLOCK、wait queue**
+
+------
+
+**三、正确的测试方法（重点）**
+
+------
+
+**✅ 场景 1：测试 scullpipe 的 非阻塞读**
+
+终端 A（读端）
+
+```
+./nbtest 1 < /dev/scullpipe0
+```
+
+含义：
+
+```
+stdin  -> scullpipe
+stdout -> 终端
+```
+
+- scullpipe 里没数据
+- `read()` 返回 `-EAGAIN`
+- 程序 **不会退出**
+- 每秒 sleep 一次
+
+👉 你可以在 `dmesg` 看到 scull 的调试打印：
+
+```
+"nbtest" reading: going to sleep
+```
+
+（如果是阻塞模式）
+
+------
+
+**✅ 场景 2：测试 scullpipe 的 非阻塞写**
+
+**终端 A（写端）**
+
+```
+./nbtest 1 > /dev/scullpipe0
+```
+
+含义：
+
+```
+stdin  -> 键盘
+stdout -> scullpipe
+```
+
+- scullpipe 满时
+- `write()` 返回 `-EAGAIN`
+- 程序继续运行
+
+------
+
+**✅ 场景 3：完整管道测试（推荐）**
+
+**终端 A（读）**
+
+```
+./nbtest 1 < /dev/scullpipe0
+```
+
+**终端 B（写）**
+
+```
+./nbtest 1 > /dev/scullpipe0
+```
+
+然后在 **B 终端输入内容**：
+
+```
+hello scull
+```
+
+观察：
+
+- B 写 → scullpipe → A 读
+- 缓冲区满/空时：**正确返回 EAGAIN、没有死锁、没有 busy loop**
+
+------
+
+**四、如果你想“更直观”地验证阻塞 vs 非阻塞**
+
+**1️⃣ 去掉 O_NONBLOCK（对比实验）**
+
+```
+// 注释这两行
+// fcntl(0, F_SETFL, ...);
+// fcntl(1, F_SETFL, ...);
+```
+
+再跑：
+
+```
+./nbtest < /dev/scullpipe0
+```
+
+你会看到：
+
+- read() **直接睡眠**
+- scull 中的 `wait_event_interruptible()` 被触发
+
+------
+
+**五、常见误区（你可能正好会踩）**
+
+**❌ 误区 1：以为要改程序里的文件名** 不需要：
+
+```
+read("/dev/scullpipe0", ...)
+```
+
+stdin/stdout **本来就是 fd**
+
+------
+
+**❌ 误区 2：一个进程同时读写 scullpipe**
+
+scullpipe 是 **半双工模型**
+
+- 最好：**一个进程只读、一个进程只写**
+
+------
+
+**六、这个测试程序“专门在测什么”**
+
+| 被测试点     | 是否覆盖 |
+| ------------ | -------- |
+| O_NONBLOCK   | ✅        |
+| EAGAIN       | ✅        |
+| wait queue   | ✅        |
+| copy_to_user | ✅        |
+| rp/wp 回绕   | ✅        |
+| 多次短读写   | ✅        |
+
+
+
+#### 使用strace的调试
+
+**一、准备条件**
+
+假设：
+
+- 设备节点：`/dev/scullpipe0`
+- 测试程序：`nbtest`
+- scull 模块已加载，最好打开了 `#define SCULL_DEBUG`
+
+------
+
+**二、用 `strace` 看 `EAGAIN`（非阻塞路径）**
+
+1️⃣ 非阻塞读：缓冲区为空
+
+**终端 A**
+
+```
+strace -e trace=read,write ./nbtest 1 < /dev/scullpipe0
+```
+
+你会看到类似输出：
+
+```
+read(0, "", 4096)        = -1 EAGAIN (Resource temporarily unavailable)
+nanosleep({tv_sec=1, tv_nsec=0}, NULL) = 0
+read(0, "", 4096)        = -1 EAGAIN (Resource temporarily unavailable)
+```
+
+内核发生了什么？
+
+```
+user read()
+  ↓
+scull_p_read()
+  → rp == wp
+  → filp->f_flags & O_NONBLOCK
+  → return -EAGAIN
+```
+
+✔ **没有进入 wait_event_interruptible**
+
+✔ **不会睡在 inq**
+
+------
+
+**2️⃣ 非阻塞写：缓冲区满**
+
+**终端 B（写端）**
+
+```
+strace -e trace=read,write ./nbtest 1 > /dev/scullpipe0
+```
+
+当 pipe 填满后：
+
+```
+write(1, "hello", 5) = -1 EAGAIN (Resource temporarily unavailable)
+```
+
+------
+
+**三、用 `strace` 看阻塞 + `EINTR`（信号中断）**
+
+这一部分最关键，能直观看到 `wait_event_interruptible()` 的效果。
+
+------
+
+**3️⃣ 阻塞读（不设 O_NONBLOCK）**
+
+**先改程序（或临时写一个）**
+
+```
+// 注释这两行
+// fcntl(0, F_SETFL, fcntl(0,F_GETFL) | O_NONBLOCK);
+// fcntl(1, F_SETFL, fcntl(1,F_GETFL) | O_NONBLOCK);
+```
+
+重新编译：
+
+```
+gcc nbtest.c -o btest
+```
+
+------
+
+**终端 A（阻塞读）**
+
+```
+strace ./btest < /dev/scullpipe0
+```
+
+你会看到：
+
+```
+read(0, 
+```
+
+然后 **卡住不动**
+
+------
+
+**4️⃣ 发送信号，中断阻塞 read**
+
+**再开一个终端 C**
+
+```
+kill -INT <pid_of_btest>
+```
+
+------
+
+**strace 输出立刻变成：**
+
+```
+--- SIGINT {si_signo=SIGINT, si_code=SI_USER, ...} ---
+read(0, 0x7ffd..., 4096) = -1 EINTR (Interrupted system call)
+```
+
+------
+
+**四、EINTR 是怎么从 scull_pipe 出来的？**
+
+**内核路径（精确对应你之前看的代码）**
+
+```
+wait_event_interruptible(dev->inq, rp != wp)
+```
+
+👇
+
+```
+if (signal_pending(current))
+    return -ERESTARTSYS;
+```
+
+👇
+
+VFS 层处理：
+
+- 普通信号 → `-EINTR`
+- SA_RESTART → 自动重启 read
+
+------
+
+**五、结合内核打印一起看（推荐）**
+
+如果你打开了 scull 的 `PDEBUG`：
+
+```
+PDEBUG("\"%s\" reading: going to sleep\n", current->comm);
+```
+
+你会看到：
+
+```
+nbtest reading: going to sleep
+```
+
+然后：
+
+```
+nbtest read interrupted by signal
+```
+
+和 `strace` 完美对应。
+
+------
+
+**六、一个非常有用的 strace 命令组合**
+
+```
+strace \
+  -tt \
+  -T \
+  -e trace=read,write,nanosleep,rt_sigsuspend \
+  ./nbtest 1 < /dev/scullpipe0
+```
+
+你能看到：
+
+- 每次 read 返回 EAGAIN 的时间间隔
+- 是否 busy loop
+- 是否真的 sleep 了 1 秒
+
+------
+
+**七、总结对照表（你以后调驱动就靠这个）**
+
+| 现象         | strace 输出        | 内核行为     |
+| ------------ | ------------------ | ------------ |
+| 非阻塞无数据 | `read = -1 EAGAIN` | 直接返回     |
+| 阻塞无数据   | `read(` 卡住       | wait_event   |
+| 信号打断     | `read = -1 EINTR`  | -ERESTARTSYS |
+| 有数据       | `read = N`         | copy_to_user |
+| 写端唤醒     | read 结束          | wake_up(inq) |
+
+
+
+## 6.3 poll 和 select
+
+使用非阻塞 `I/O` 的应用程序常常使用 `poll`, `select`, 和 ``epoll`` 系统调用。 `poll`, `select`, 和 ``epoll`` 本质上有相同的功能: 每个允许一个进程来决定它是否可读或者写一个或多个文件而不阻塞。这些调用也可阻塞进程直到任何一个给定集合的文件描述符可用来读或写。因此, 它们常常用在必须使用多输入输出流的应用程序, 而不必粘连在它们任何一个上。相同的功能常常由多个函数提供, 因为 2 个是由不同的团队在几乎相同时间完成的: `select` 在 BSD Unix 中引入, 而 `poll` 是 System V 的解决方案。`epoll` 调用添加在 `2.5.45`, 作为使查询函数扩展到几千个文件描述符的方法。
+
+支持任何一个这些调用都需要来自设备驱动的支持. 这个支持(对所有 3 个调用)由驱动的 poll 方法调用. 这个方法由下列的原型:
+
+~~~c
+unsigned int (*poll) (struct file *filp, poll_table *wait);
+~~~
+
+这个驱动方法被调用, 无论何时用户空间程序进行一个  `poll`, `select`, 或 ``epoll``  系统调用, 涉及一个和驱动相关的文件描述符。这个设备方法负责这 2 步:
+
+> 1. 在一个或多个可指示查询状态变化的等待队列上调用 `poll_wait`。如果没有文件描述符可用作 `I/O`, 内核使这个进程在等待队列上等待所有的传递给系统调用的文件描述符。
+> 2. 返回一个位掩码, 描述可能不必阻塞就立刻进行的操作。
+
+这 2 个操作常常是直接的, 并且趋向与各个驱动看起来类似。但是, 它们依赖只能由驱动提供的信息, 因此, 必须由每个驱动单独实现。
+
+`poll_table` 结构, 给 `poll` 方法的第 2 个参数, 在内核中用来实现  `poll`, `select`, 或 ``epoll``  调用; 它在 `<linux/poll.h>`中声明, 这个文件必须被驱动源码包含。驱动编写者不必要知道所有它内容并且必须作为一个不透明的对象使用它; 它被传递给驱动方法以便驱动可用每个能唤醒进程的等待队列来加载它, 并且可改变 `poll` 操作状态。驱动增加一个等待队列到 poll_table 结构通过调用函数 `poll_wait`:
+
+~~~c
+void poll_wait (struct file *, wait_queue_head_t *, poll_table *);
+~~~
+
+`poll` 方法的第 2 个任务是返回位掩码, 它描述哪个操作可马上被实现; 这也是直接的。例如, 如果设备有数据可用, 一个读可能不必睡眠而完成; `poll` 方法应当指示这个时间状态。几个标志(通过 `<linux/poll.h>` 定义)用来指示可能的操作:
+
+~~~c
+POLLIN
+~~~
+
+> 如果设备可被不阻塞地读, 这个位必须设置。
+
+------------------------
+
+~~~c
+POLLRDNORM
+~~~
+
+> 这个位必须设置, 如果"正常"数据可用来读。一个可读的设备返回( `POLLIN|POLLRDNORM` )。
+
+------------------------
+
+~~~c
+POLLRDBAND
+~~~
+
+> 这个位指示带外数据可用来从设备中读取。当前只用在 Linux 内核的一个地方( DECnet 代码 )并且通常对设备驱动不可用。
+
+------------------------
+
+~~~c
+POLLPRI
+~~~
+
+> 高优先级数据(带外)可不阻塞地读取。这个位使 `select` 报告在文件上遇到一个异常情况, 因为 select 报告带外数据作为一个异常情况。
+
+------------------------
+
+~~~c
+POLLHUP
+~~~
+
+> 当读这个设备的进程见到文件尾, 驱动必须设置 `POLLUP`(hang-up)。 一个调用select 的进程被告知设备是可读的, 如同 selcet 功能所规定的。
+
+------------------------
+
+~~~c
+POLLERR
+~~~
+
+> 一个错误情况已在设备上发生。当调用 `poll`, 设备被报告位可读可写, 因为读写都返回一个错误码而不阻塞。
+
+------------------------
+
+~~~c
+POLLOUT
+~~~
+
+> 这个位在返回值中设置, 如果设备可被写入而不阻塞。
+
+------------------------
+
+~~~c
+POLLWRNORM
+~~~
+
+> 这个位和 `POLLOUT` 有相同的含义, 并且有时它确实是相同的数。一个可写的设备返回( `POLLOUT|POLLWRNORM`).
+
+------------------------
+
+~~~c
+POLLWRBAND
+~~~
+
+> 如同 `POLLRDBAND` , 这个位意思是带有零优先级的数据可写入设备。只有 `poll` 的数据报实现使用这个位, 因为一个数据报看传送带外数据。
+
+------------------------
+
+应当重复一下 `POLLRDBAND` 和 `POLLWRBAND` 仅仅对关联到 `socket` 的文件描述符有意义:通常设备驱动不使用这些标志。`poll` 的描述使用了大量在实际使用中相对简单的东西。考虑 `poll` 方法的 `scullpipe` 实现:
+
+~~~c
+static unsigned int scull_p_poll(struct file *filp, poll_table *wait)
+{
+	struct scull_pipe *dev = filp->private_data;
+	unsigned int mask = 0;
+
+	/*
+	 * The buffer is circular; it is considered full
+	 * if "wp" is right behind "rp" and empty if the
+	 * two are equal.
+	 */
+	mutex_lock(&dev->lock);
+	poll_wait(filp, &dev->inq,  wait);
+	poll_wait(filp, &dev->outq, wait);
+	if (dev->rp != dev->wp)
+		mask |= POLLIN | POLLRDNORM;	/* readable */
+	if (spacefree(dev))
+		mask |= POLLOUT | POLLWRNORM;	/* writable */
+	mutex_unlock(&dev->lock);
+	return mask;
+}
+
+~~~
+
+这个代码简单地增加了 2 个 `scullpipe` 等待队列到 `poll_table`, 接着设置正确的掩码位, 根据数据是否可以读或写。
+
+所示的 `poll` 代码缺乏文件尾支持, 因为 `scullpipe` 不支持文件尾情况。对大部分真实的设备, `poll` 方法应当返回 `POLLHUP` 如果没有更多数据(或者将)可用。如果调用者使用`select` 系统调用, 文件被报告为可读。不管是使用 `poll` 还是 `select`, 应用程序知道它能够调用 `read` 而不必永远等待, 并且 `read` 方法返回 0 来指示文件尾。
+
+例如, 对于 真正的`FIFO`, 读者见到一个文件尾当所有的写者关闭文件, 而在 `scullpipe`中读者永远见不到文件尾。这个做法不同是因为 `FIFO` 是用作一个 2 个进程的通讯通道,而 scullpipe 是一个垃圾桶, 人人都可以放数据只要至少有一个读者。更多地, 重新实现内核中已有的东西是没有意义的, 因此我们选择在我们的例子里实现一个不同的做法。
+
+与 `FIFO` 相同的方式实现文件尾就意味着检查 `dev->nwwriters`, 在 `read` 和 `poll` 中,并且报告文件尾(如刚刚描述过的)如果没有进程使设备写打开。不幸的是, 使用这个实现方法, 如果一个读者打开 `scullpipe` 设备在写者之前, 它可能见到文件尾而没有机会来等待数据。解决这个问题的最好的方式是在 open 中实现阻塞, 如同真正的 `FIFO` 所做的;这个任务留作读者的一个练习。
+
+
+
+### 6.3.1 与 read 和 write 的交互
+
+`poll` 和 `select` 调用的目的是提前决定是否一个 `I/O` 操作会阻塞. 在那个方面, 它们补充了 `read` 和 `write`。更重要的是, poll 和 select , 因为它们使应用程序同时等待几个数据流, 尽管我们在 scull 例子里没有采用这个特性。
+
+一个正确的实现对于使应用程序正确工作是必要的: 尽管下列的规则或多或少已经说明过,我们在此总结它们。
+
+#### 6.3.1.1 从设备中读数据
+
+> * 如果在输出缓冲中有空间, `write` 应当不延迟返回。它可接受小于这个调用所请求的数据, 但是它必须至少接受一个字节。在这个情况下, `poll` 报告这个设备是可写的, 通过返回 `POLLOUT|POLLWRNORM`。
+> * 如果输出缓冲是满的, 缺省地 write 阻塞直到一些空间被释放。如果 `O_NOBLOCK`被设置, `write` 立刻返回一个 `-EAGAIN`(老式的 System V Unices 返回 0)。在这些情况下, `poll` 应当报告文件是不可写的。另一方面, 如果设备不能接受任何多余数据, `write` 返回 `-ENOSPC`("设备上没有空间"), 不管是否设置了 `O_NONBLOCK`。
+> * 在返回之前不要调用 `wait` 来传送数据, 即便当 `O_NONBLOCK` 被清除。这是因为许多应用程序选择来找出一个 `write` 是否会阻塞。如果设备报告可写, 调用必须不阻塞。如果使用设备的程序想保证它加入到输出缓冲中的数据被真正传送, 驱动必须提供一个 `fsync` 方法。例如, 一个可移除的设备应当有一个 `fsnyc` 入口。
+
+
+
+#### 6.3.1.2  写入设备
+
+> * 如果在输出缓冲中有空间, `write` 应当不延迟返回。它可接受小于这个调用所请求的数据, 但是它必须至少接受一个字节。在这个情况下, poll 报告这个设备是可写的, 通过返回 `POLLOUT|POLLWRNORM`。
+> * 如果输出缓冲是满的, 缺省地 `write` 阻塞直到一些空间被释放。如果 `O_NOBLOCK`被设置, `write` 立刻返回一个 `-EAGAIN`(老式的 System V Unices 返回 0)。在这些情况下, `poll` 应当报告文件是不可写的。另一方面, 如果设备不能接受任何多余数据, `write` 返回 `-ENOSPC`("设备上没有空间"), 不管是否设置了`O_NONBLOCK`。
+> * 在返回之前不要调用 `wait` 来传送数据, 即便当 `O_NONBLOCK` 被清除。这是因为许多应用程序选择来找出一个 `write` 是否会阻塞。如果设备报告可写, 调用必须不阻塞. 如果使用设备的程序想保证它加入到输出缓冲中的数据被真正传送, 驱动必须提供一个 `fsync` 方法。例如, 一个可移除的设备应当有一个 `fsnyc` 入口。
+
+尽管有一套通用的规则, 还应当认识到每个设备是唯一的并且有时这些规则必须稍微弯曲一下。例如, 面向记录的设备(例如磁带设备)无法执行部分写。
+
+
+
+#### 6.3.1.3 刷新挂起的输出
+
+们已经见到 `write` 方法如何自己不能解决全部的输出需要。`fsync` 函数, 由同名的系统调用而调用, 填补了这个空缺。这个方法原型是:
+
+~~~c
+int (*fsync) (struct file *file, struct dentry *dentry, int datasync);
+~~~
+
+如果一些应用程序需要被确保数据被发送到设备, `fsync` 方法必须被实现为不管`O_NONBLOCK` 是否被设置。对 `fsync` 的调用应当只在设备被完全刷新时返回(即, 输出缓冲为空), 即便这需要一些时间。`datasync` 参数用来区分 `fsync` 和 `fdatasync` 系统调用;这样, 它只对文件系统代码有用, 驱动可以忽略它。
+
+`fsync` 方法没有不寻常的特性。这个调用不是时间关键的, 因此每个设备驱动可根据作者的口味实现它。大部分的时间, 字符驱动只有一个 `NULL` 指针在它们的 `fops` 中阻塞设备, 另一方面, 常常实现这个方法使用通用的`block_fsync`, 它接着会刷新设备的所有的块。
+
+
+
+### 6.3.2 底层的数据结构
+
+`poll` 和 `select` 系统调用的真正实现是相当地简单, 对那些感兴趣于它如何工作的人;`epoll` 更加复杂一点但是建立在同样的机制上。无论何时用户应用程序调用 `poll`,`select`, 或者 `epoll_ctl`,内核调用这个系统调用所引用的所有文件的 `poll` 方法,传递相同的 `poll_table` 到每个。`poll_table` 结构只是对一个函数的封装, 这个函数建立了实际的数据结构。那个数据结构, 对于 `poll`和 `select`, 是一个内存页的链表, 其中包含 `poll_table_entry` 结构。每个 `poll_table_entry` 持有被传递给 `poll_wait` 的`struct file` 和 `wait_queue_head_t` 指针, 以及一个关联的等待队列入口。对`poll_wait` 的调用有时还添加这个进程到给定的等待队列。整个的结构必须由内核维护以至于这个进程可被从所有的队列中去除, 在 `poll` 或者 `select` 返回之前。
+
+如果被轮询的驱动没有一个指示 `I/O` 可不阻塞地发生, `poll` 调用简单地睡眠直到一个它所在的等待队列(可能许多)唤醒它。在 `poll` 实现中有趣的是驱动的 `poll` 方法可能被用一个 `NULL` 指针作为 `poll_table` 参数。这个情况出现由于几个理由。如果调用 `poll` 的应用程序已提供了一个 0 的超时值(指示不应当做等待), 没有理由来堆积等待队列, 并且系统简单地不做它。`poll_table`指针还被立刻设置为 `NULL` 在任何被轮询的驱动指示可以 `I/O` 之后。因为内核在那一点知道不会发生等待, 它不建立等待队列链表。
+
+当 `poll` 调用完成, `poll_table` 结构被去分配, 并且所有的之前加入到 `poll` 表的等待队列入口被从表和它们的等待队列中移出。我们试图在图`poll` 背后的数据结构中展示包含在轮询中的数据结构; 这个图是真实数据结构的简化地表示, 因为它忽略了一个 `poll` 表地多页性质并且忽略了每个`poll_table_entry` 的文件指针。
+
+#### poll 和 select
+
+**1️⃣ 整体视图（一次 `poll()` 调用）**
+
+```
+┌───────────────────────────────┐
+│        user process           │
+│                               │
+│        poll()/select()        │
+└──────────────┬────────────────┘
+               │
+               ▼
+┌───────────────────────────────┐
+│          poll core            │
+│                               │
+│   struct poll_table pt        │
+│   ┌───────────────────────┐   │
+│   │ pt->_qproc = function │◄──┼── poll_wait()
+│   │ pt->_key              │   │
+│   └───────────────────────┘   │
+│                               │
+└──────────────┬────────────────┘
+               │ same poll_table*
+               ▼
+     ┌────────────────────────────┐
+     │      file->f_op->poll()    │
+     └──────────────┬─────────────┘
+                    │
+                    ▼
+           ┌───────────────────┐
+           │   poll_wait()     │
+           │                   │
+           │ build wait entry  │
+           └────────┬──────────┘
+                    ▼
+        ┌────────────────────────────┐
+        │  poll_table_entry          │
+        │                            │
+        │  struct file *filp         │
+        │  wait_queue_head_t *wq     │
+        │  wait_queue_entry_t wait   │
+        └────────┬───────────────────┘
+                 │
+                 ▼
+        ┌────────────────────────────┐
+        │   wait_queue_head_t        │
+        │   (device wait queue)      │
+        │                            │
+        │  [ wait_queue_entry ]      │◄── current task
+        └────────────────────────────┘
+```
+
+------
+
+**2️⃣ poll_table 内部结构（简化）**
+
+> 实际上是 **多页链表**，这里画成单页方便理解
+
+```
+struct poll_table
+┌─────────────────────────┐
+│ _qproc  ─────────────┐  │
+│ _key                 │  │
+│                      │  │
+│  ┌────────────────┐  │  │
+│  │ poll_page      │ ◄┘  │
+│  │                │     │
+│  │ entries[]      │     │
+│  │  ┌──────────┐  │     │
+│  │  │ pte[0]   │─-┼─────┼──► poll_table_entry
+│  │  ├──────────┤  │     │
+│  │  │ pte[1]   │──┼─────┘
+│  │  └──────────┘  │     |
+│  └────────────────┘     |
+└─────────────────────────┘
+```
+
+------
+
+**3️⃣ poll_table_entry 细节（关键结构）**
+
+```
+struct poll_table_entry
+┌─────────────────────────────┐
+│ struct file *filp           │───► file
+│                             │
+│ wait_queue_head_t *wait     │───► device wait queue
+│                             │
+│ wait_queue_entry_t entry    │
+│  ┌──────────────────────┐   │
+│  │ task = current       │◄──┼── current process
+│  │ func = wake_function │   │
+│  └──────────────────────┘   │
+└─────────────────────────────┘
+```
+
+------
+
+**4️⃣ 多文件、多等待队列的真实情况**
+
+```
+              current process
+                     │
+     ┌───────────────┼────────────────┐
+     │               │                │
+     ▼               ▼                ▼
+┌────────────┐  ┌────────────┐   ┌────────────┐
+│  pte A     │  │  pte B     │   │  pte C     │
+└────┬───────┘  └────┬───────┘   └────┬───────┘
+     │               │                │
+     ▼               ▼                ▼
+┌───────────┐   ┌───────────┐    ┌───────────┐
+│ wq A      │   │ wq B      │    │ wq C      │
+│ (socket)  │   │ (tty)     │    │ (pipe)    │
+└───────────┘   └───────────┘    └───────────┘
+```
+
+➡️ **一个 poll 进程可以同时挂在多个设备的等待队列上**
+
+------
+
+**5️⃣ `poll_table == NULL` 的特殊路径**
+
+```
+user poll(timeout = 0)
+        │
+        ▼
+kernel sets poll_table = NULL
+        │
+        ▼
+driver->poll(filp, NULL)
+        │
+        ▼
+no poll_wait()
+no wait_queue_entry
+just check device state
+```
+
+等价于：
+
+```
+if (table)
+    poll_wait(filp, &dev->wait, table);
+```
+
+------
+
+**6️⃣ poll 返回时的清理过程（非常关键）**
+
+```
+poll returns
+    │
+    ▼
+walk poll_table pages
+    │
+    ▼
+for each poll_table_entry:
+    ├─ remove from wait_queue
+    └─ free entry
+    ▼
+free poll_table pages
+```
+
+ASCII 简化：
+
+```
+poll_table
+   │
+   ├── pte A ──X──> wq A
+   ├── pte B ──X──> wq B
+   └── pte C ──X──> wq C
+```
+
+------
+
+**7️⃣ 一句话总结（给你“内核视角”的直觉）**
+
+> **`poll/select` 本质就是：
+>  把当前进程“临时挂”到多个设备的等待队列上，
+>  谁先唤醒，谁赢，
+>  返回前全部拆干净。**
+
+#### epoll
+
+> 结论先行一句话：
+>  **`epoll = 把 poll_table 的“临时结构”变成“持久结构” + 事件就绪链表**。
+
+------
+
+**1️⃣ epoll 的整体架构（一次 epoll 实例）**
+
+```
+             user process
+                 │
+                 ▼
+             epoll_create()
+                 │
+                 ▼
+┌────────────────────────────────┐
+│          eventpoll             │   ← 一个 epoll fd
+│                                │
+│  rbr  (red-black tree)         │─── 管“监听了哪些 fd”
+│                                │
+│  rdllist (ready list)          │─── 管“哪些 fd 就绪了”
+│                                │
+│  wait_queue_head_t wq          │─── epoll_wait 睡这里
+│                                │
+│  struct file *file             │
+└───────────────┬────────────────┘
+                │
+                ▼
+           epoll_wait()
+```
+
+------
+
+**2️⃣ epoll_ctl(ADD) 时发生了什么**
+
+```
+ epoll_ctl(EPOLL_CTL_ADD, fd)
+              │
+              ▼
+            kernel 
+              │
+              ▼
+┌─────────────────────────────┐
+│      ep_insert()            │
+└──────────────┬──────────────┘
+               ▼
+        driver->poll(filp, pt)
+               │
+               ▼
+         poll_wait()
+```
+
+⚠️ **关键差异点**：
+ 这里用的 `poll_table` 是 **epoll 自己的、长期存在的**。
+
+------
+
+**3️⃣ epoll 核心对象关系图**
+
+```
+eventpoll (ep)
+│
+├─ rbr (红黑树)
+│   │
+│   ├─ epitem (fd=3)
+│   │    │
+│   │    ├─ struct file *filp
+│   │    ├─ epoll_event event
+│   │    └─ struct list_head pwqlist
+│   │           │
+│   │           ▼
+│   │     eppoll_entry
+│   │           │
+│   │           ▼
+│   │     wait_queue_entry
+│   │           │
+│   │           ▼
+│   │     device wait_queue
+│   │
+│   ├─ epitem (fd=4)
+│   │    └─ ...
+│   └─ ...
+│
+└─ rdllist (就绪链表)
+    │
+    ├─ epitem (fd=4)
+    └─ epitem (fd=7)
+```
+
+------
+
+**4️⃣ eppoll_entry（epoll 的“poll_table_entry”）**
+
+```
+struct eppoll_entry
+┌──────────────────────────────┐
+│ struct epitem *epi           │──► 关联的 epitem
+│                              │
+│ wait_queue_entry_t wait      │
+│  ┌────────────────────────┐ │
+│  │ task = ep->poll_task   │◄┼── epoll 的唤醒回调
+│  │ func = ep_poll_callback│ │
+│  └────────────────────────┘ │
+│                              │
+│ wait_queue_head_t *whead     │──► 设备等待队列
+└──────────────────────────────┘
+```
+
+👉 和 `poll_table_entry` 对比：
+
+| poll             | epoll              |
+| ---------------- | ------------------ |
+| 临时             | **持久**           |
+| poll_table_entry | **eppoll_entry**   |
+| 每次 poll 构建   | epoll_ctl 时构建   |
+| poll 返回就释放  | close / DEL 才释放 |
+
+------
+
+**5️⃣ 设备就绪时的唤醒路径（最关键）**
+
+```
+           device ready
+               │
+               ▼
+        wake_up(wait_queue)
+               │
+               ▼
+        ep_poll_callback()
+               │
+               ▼
+┌───────────────────────────┐
+│ epitem 加入 ep->rdllist    │
+└──────────────┬────────────┘
+               ▼
+         wake_up(ep->wq)
+               │
+               ▼
+        epoll_wait() 返回
+```
+
+ASCII 合起来看：
+
+```
+device
+  │
+  ▼
+wait_queue_head_t
+  │
+  ▼
+eppoll_entry.wait
+  │
+  ▼
+ep_poll_callback
+  │
+  ▼
+ep->rdllist ───► epitem
+  │
+  ▼
+ep->wq ───► epoll_wait 唤醒
+```
+
+------
+
+**6️⃣ epoll_wait() 做了什么**
+
+```
+epoll_wait()
+   │
+   ├─ rdllist 非空？
+   │     ├─ 是 → 直接拷贝事件到用户态
+   │     └─ 否 → 睡在 ep->wq
+   │
+   └─ 根据 LT / ET 决定是否保留 epitem
+```
+
+------
+
+**7️⃣ LT vs ET（结构层面的差异）**
+
+LT（默认）
+
+```
+rdllist:
+[ epitem(fd=3) ]──>[ epitem(fd=3) ]──>[ epitem(fd=3) ]
+```
+
+> 没读干净 → 还会反复就绪
+
+ET
+
+```
+rdllist:
+[ epitem(fd=3) ]   (一次)
+```
+
+> 必须 **读到 EAGAIN**
+
+------
+
+**8️⃣ epoll vs poll 的结构对照表（强烈建议记住）**
+
+```
+poll/select                  epoll
+────────────────────────────────────────
+poll_table               →   eventpoll
+poll_table_entry         →   eppoll_entry
+wait queue 临时挂载        →   永久挂载
+每次系统调用遍历 fd         →   事件驱动
+无 ready list            →   rdllist
+```
+
+------
+
+**9️⃣ 一句话“内核工程师版总结”**
+
+> **epoll 的本质不是“更快的 poll”，而是：
+>  👉 把“谁关心谁”这件事提前注册，
+>  👉 把“谁好了”这件事变成事件推送。**
+
+
+
+## 6.4 异步通知
+
+尽管阻塞和非阻塞操作和 select 方法的结合对于查询设备在大部分时间是足够的, 一些情况还不能被我们迄今所见到的技术来有效地解决。让我们想象一个进程, 在低优先级上执行一个长计算循环, 但是需要尽可能快的处理输入数据。如果这个进程在响应新的来自某些数据获取外设的报告, 它应当立刻知道当新数据可用时。这个应用程序可能被编写来调用 poll 有规律地检查数据, 但是, 对许多情况,有更好的方法。通过使能异步通知, 这个应用程序可能接受一个信号无论何时数据可用并且不需要让自己去查询。
+
+用户程序必须执行 2 个步骤来使能来自输入文件的异步通知。首先, 它们指定一个进程作为文件的拥有者。当一个进程使用 `fcntl` 系统调用发出 `F_SETOWN` 命令, 这个拥有者进程的 ID 被保存在 `filp->f_owner` 给以后使用。这一步对内核知道通知谁是必要的。为了真正使能异步通知, 用户程序必须设置 `FASYNC` 标志在设备中, 通过 `F_SETFL` `fcntl`命令。
+
+在这 2 个调用已被执行后, 输入文件可请求递交一个 `SIGIO` 信号, 无论何时新数据到达。信号被发送给存储于 `filp->f_owner` 中的进程(或者进程组, 如果值为负值)。例如, 下面的用户程序中的代码行使能了异步的通知到当前进程, 给 `stdin` 输入文件:
+
+~~~c
+signal(SIGIO, &input_handler); /* dummy sample; sigaction() is better */
+fcntl(STDIN_FILENO, F_SETOWN, getpid());
+oflags = fcntl(STDIN_FILENO, F_GETFL);
+fcntl(STDIN_FILENO, F_SETFL, oflags | FASYNC);
+~~~
+
+这个在源码中名为 `asynctest` 的程序是一个简单的程序, 读取 `stdin`。它可用来测试`scullpipe` 的异步能力。这个程序和 `cat`       类似但是不结束于文件尾; 它只响应输入, 而不是没有输入。
+
+~~~c
+/*
+ * asynctest.c: use async notification to read stdin
+ *
+ * Copyright (C) 2001 Alessandro Rubini and Jonathan Corbet
+ * Copyright (C) 2001 O'Reilly & Associates
+ *
+ * The source code in this file can be freely used, adapted,
+ * and redistributed in source or binary form, so long as an
+ * acknowledgment appears in derived source files.  The citation
+ * should list that the code comes from the book "Linux Device
+ * Drivers" by Alessandro Rubini and Jonathan Corbet, published
+ * by O'Reilly & Associates.   No warranty is attached;
+ * we cannot take responsibility for errors or fitness for use.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <fcntl.h>
+
+int gotdata=0;
+void sighandler(int signo)
+{
+    if (signo==SIGIO)
+        gotdata++;
+    return;
+}
+
+char buffer[4096];
+
+int main(int argc, char **argv)
+{
+    int count;
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = sighandler;
+    action.sa_flags = 0;
+
+    sigaction(SIGIO, &action, NULL);
+
+    fcntl(STDIN_FILENO, F_SETOWN, getpid());
+    fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | FASYNC);
+
+    while(1) {
+        /* this only returns if a signal arrives */
+        sleep(86400); /* one day */
+        if (!gotdata)
+            continue;
+        count=read(0, buffer, 4096);
+        /* buggy: if avail data is more than 4kbytes... */
+        count=write(1,buffer,count);
+        gotdata=0;
+    }
+}
+
+~~~
+
+注意, 不是所有的设备都支持异步通知, 并且你可选择不提供它。应用程序常常假定异步能力只对 `socket` 和 `tty` 可用。输入通知有一个剩下的问题。当一个进程收到一个 `SIGIO`, 它不知道哪个输入文件有新数据提供。如果多于一个文件被使能异步地通知挂起输入的进程, 应用程序必须仍然靠`poll` 或者 `select` 来找出发生了什么。
+
+
+
+### 6.4.1 驱动的观点
+
+对我们来说一个更相关的主题是设备驱动如何实现异步信号。下面列出了详细的操作顺序,从内核的观点:
+
+> 1. 当发出 `F_SETOWN`, 什么都没发生, 除了一个值被赋值给 `filp->f_owner`。
+> 2. 当 `F_SETFL` 被执行来打开 `FASYNC`, 驱动的 `fasync` 方法被调用。这个方法被调用无论何时 `FASYNC` 的值在 `filp->f_flags` 中被改变来通知驱动这个变化, 因此它可正确地响应。这个标志在文件被打开时缺省地被清除. 我们将看这个驱动方法的标准实现, 在本节。
+> 3. 当数据到达, 所有的注册异步通知的进程必须被发出一个 `SIGIO` 信号。
+
+虽然实现第一步是容易的--在驱动部分没有什么要做的--其他的步骤包括维护一个动态数据结构来跟踪不同的异步读者; 可能有几个。这个动态数据结构, 但是, 不依赖特殊的设备, 并且内核提供了一个合适的通用实现这样你不必重新编写同样的代码给每个驱动。
+
+Linux 提供的通用实现是基于一个数据结构和 2 个函数(它们在前面所说的第 2 步和第3 步被调用)。声明相关材料的头文件是`<linux/fs.h>`(这里没新东西), 并且数据结构被称为 `struct fasync_struct`。至于等待队列, 我们需要插入一个指针在设备特定的数据结构中。驱动调用的 2 个函数对应下面的原型:
+
+~~~c
+int fasync_helper(int fd, struct file *filp, int mode, 
+                  struct fasync_struct **fa);
+void kill_fasync(struct fasync_struct **fa, int sig, int band);
+~~~
+
+`fasync_helper` 被调用来从相关的进程列表中添加或去除入口项, 当 `FASYNC` 标志因一个打开文件而改变。它的所有参数除了最后一个, 都被提供给 `fasync` 方法并且被直接传递。当数据到达时 `kill_fasync` 被用来通知相关的进程。它的参数是被传递的信号(常常是`SIGIO`)和 `band`, 这几乎都是 `POLL_IN` (但是这可用来发送"紧急"或者带外数据, 在网络代码里).这是 scullpipe 如何实现 `fasync` 方法的:
+
+~~~c
+static int scull_p_fasync(int fd, struct file *filp, int mode)
+{
+	struct scull_pipe *dev = filp->private_data;
+
+	return fasync_helper(fd, filp, mode, &dev->async_queue);
+}
+~~~
+
+显然所有的工作都由 `fasync_helper` 进行。但是, 不可能实现这个功能在没有一个方法在驱动里的情况下, 因为这个帮忙函数需要存取正确的指向 `struct fasync_struct` (这里是 与`dev->async_queue`)的指针, 并且只有驱动可提供这个信息。
+
+当数据到达, 下面的语句必须被执行来通知异步读者. 因为对 sucllpipe 读者的新数据通过一个发出 `write` 的进程被产生, 这个语句出现在 scullpipe 的 `write` 方法中。
+
+~~~c
+static ssize_t scull_p_write(struct file *filp, const char __user *buf, size_t count,
+                loff_t *f_pos)
+{
+	struct scull_pipe *dev = filp->private_data;
+	int result;
+
+	if (mutex_lock_interruptible(&dev->lock))
+		return -ERESTARTSYS;
+
+	/* Make sure there's space to write */
+	result = scull_getwritespace(dev, filp);
+	if (result)
+		return result; /* scull_getwritespace called up(&dev->sem) */
+
+	/* ok, space is there, accept something */
+	count = min(count, (size_t)spacefree(dev));
+	if (dev->wp >= dev->rp)
+		count = min(count, (size_t)(dev->end - dev->wp)); /* to end-of-buf */
+	else /* the write pointer has wrapped, fill up to rp-1 */
+		count = min(count, (size_t)(dev->rp - dev->wp - 1));
+	PDEBUG("Going to accept %li bytes to %p from %p\n", (long)count, dev->wp, buf);
+	if (copy_from_user(dev->wp, buf, count)) {
+		mutex_unlock(&dev->lock);
+		return -EFAULT;
+	}
+	dev->wp += count;
+	if (dev->wp == dev->end)
+		dev->wp = dev->buffer; /* wrapped */
+	mutex_unlock(&dev->lock);
+
+	/* finally, awake any reader */
+	wake_up_interruptible(&dev->inq);  /* blocked in read() and select() */
+
+	/* and signal asynchronous readers, explained late in chapter 5 */
+	if (dev->async_queue)
+		kill_fasync(&dev->async_queue, SIGIO, POLL_IN);
+	PDEBUG("\"%s\" did write %li bytes\n",current->comm, (long)count);
+	return count;
+}
+~~~
+
+35-36 行：
+
+~~~c
+	if (dev->async_queue)
+		kill_fasync(&dev->async_queue, SIGIO, POLL_IN);
+~~~
+
+注意, 一些设备还实现异步通知来指示当设备可被写入时; 在这个情况, 当然,`kill_fasnyc` 必须被使用一个 `POLL_OUT` 模式来调用。可能会出现我们已经完成但是仍然有一件事遗漏。我们必须调用我们的 `fasync` 方法, 当文件被关闭来从激活异步读者列表中去除文件. 尽管这个调用仅当 `filp->f_flags` 被设置为 `FASYNC` 时需要, 调用这个函数无论如何不会有问题并且是常见的实现。下面的代码行, 例如, 是 scullpipe 的 release 方法的一部分:
+
+~~~c
+static int scull_p_release(struct inode *inode, struct file *filp)
+{
+	struct scull_pipe *dev = filp->private_data;
+
+	/* remove this filp from the asynchronously notified filp's */
+	scull_p_fasync(-1, filp, 0);
+	mutex_lock(&dev->lock);
+	if (filp->f_mode & FMODE_READ)
+		dev->nreaders--;
+	if (filp->f_mode & FMODE_WRITE)
+		dev->nwriters--;
+	if (dev->nreaders + dev->nwriters == 0) {
+		kfree(dev->buffer);
+		dev->buffer = NULL; /* the other fields are not checked on open */
+	}
+	mutex_unlock(&dev->lock);
+	return 0;
+}
+~~~
+
+5-6 行：
+
+~~~c
+	/* remove this filp from the asynchronously notified filp's */
+	scull_p_fasync(-1, filp, 0);
+~~~
+
+这个在异步通知之下的数据结构一直和结构 `struct wait_queue` 是一致的, 因为 2 种情况都涉及等待一个事件。区别是这个 `struct file` 被用来替代 `struct task_struct`。队列中的结构 file 接着用来存取 f_owner, 为了通知进程。
+
+
+
+## 6.5 移位一个设备
+
+本章最后一个需要我们涉及的东西是 llseek 方法, 它有用(对于某些设备)并且容易实现。
+
+### 6.5.1 llseek 实现
+
+`llseek` 方法实现了 `lseek` 和 `llseek` 系统调用。我们已经说了如果 `llseek` 方法从设备的操作中缺失, 内核中的缺省的实现进行移位通过修改 `filp->f_pos`, 这是文件中的当前读写位置。请注意对于 `lseek` 系统调用要正确工作, 读和写方法必须配合, 通过使用和更新它们收到的作为的参数的 offset 项.你可能需要提供你自己的方法, 如果移位操作对应一个在设备上的物理操作。一个简单的例子可在 scull 驱动中找到:
+
+~~~c
+/*
+ * The "extended" operations -- only seek
+ */
+
+loff_t scull_llseek(struct file *filp, loff_t off, int whence)
+{
+	struct scull_dev *dev = filp->private_data;
+	loff_t newpos;
+
+	switch(whence) {
+	  case 0: /* SEEK_SET */
+		newpos = off;
+		break;
+
+	  case 1: /* SEEK_CUR */
+		newpos = filp->f_pos + off;
+		break;
+
+	  case 2: /* SEEK_END */
+		newpos = dev->size + off;
+		break;
+
+	  default: /* can't happen */
+		return -EINVAL;
+	}
+	if (newpos < 0) return -EINVAL;
+	filp->f_pos = newpos;
+	return newpos;
+}
+~~~
+
+唯一设备特定的操作是从设备中获取文件长度。在 scull 中 read 和 write 方法如需要地一样协作, 如同在第 3 章所示。尽管刚刚展示的这个实现对 scull 有意义, 它处理一个被很好定义了的数据区, 大部分设备提供了一个数据流而不是一个数据区(想想串口或者键盘), 并且移位这些设备没有意义。如果这就是你的设备的情况, 你不能只制止声明 llseek 操作, 因为缺省的方法允许移位。相反, 你应当通知内核你的设备不支持 llseek , 通过调用 onseekable_open 在你的 open 方法中。
+
+~~~c
+int nonseekable_open(struct inode *inode; struct file *filp);
+~~~
+
+这个调用标识了给定的 `filp` 为不可移位的; 内核从不允许一个 `lseek` 调用在这样一个文件上成功。通过用这样的方式标识这个文件, 你可确定不会有通过 `pread` 和 `pwrite`系统调用的方式来试图移位这个文件。
+
+完整起见, 你也应该在你的 `file_operations` 结构中设置 `llseek` 方法到一个特殊的帮忙函数 `no_llseek`, 它定义在 `<linux/fs.h>`。
+
+
+
+## 6.6 在一个设备文件上的存取控制
+
+提供存取控制对于一个设备节点来说有时是至关重要的。不仅是非授权用户不能使用设备(由文件系统许可位所强加的限制), 而且有时只有授权用户才应当被允许来打开设备一次。
+
+这个问题类似于使用 `ttys` 的问题。在那个情况下, `login` 进程改变设备节点的所有权,无论何时一个用户登录到系统, 为了阻止其他的用户打扰或者偷听这个 `tty` 的数据流。但是, 仅仅为了保证对它的唯一读写而使用一个特权程序在每次打开它时改变一个设备的拥有权是不实际的。
+
+迄今所显示的代码没有实现任何的存取控制, 除了文件系统许可位。如果系统调用 `open`将请求递交给驱动, `open` 就成功了。我们现在介绍几个新技术来实现一些额外的检查。每个在本节中展示的设备有和空的 scull 设备有相同的行为(即, 它实现一个持久的内存区)但是在存取控制方面和 scull 不同, 这个实现在 `open` 和 `release` 操作中。
+
+
+
+### 6.6.1 单 open 设备
+
+提供存取控制的强力方式是只允许一个设备一次被一个进程打开(单次打开)。这个技术最好是避免因为它限制了用户的灵活性。一个用户可能想运行不同的进程在一个设备上, 一个读状态信息而另一个写数据。在某些情况下, 用户通过一个外壳脚本运行几个简单的程序可做很多事情, 只要它们可并发存取设备。换句话说, 实现一个单 `open` 行为实际是在创建策略, 这样可能会介入你的用户要做的范围。
+
+只允许单个进程打开设备有不期望的特性, 但是它也是一个设备驱动最简单实现的存取控制, 因此它在这里被展示。这个源码是从一个称为 `scullsingle` 的设备中提取的。
+
+`scullsingle` 设备维护一个 `atiomic_t` 变量, 称为 `scull_s_available`; 这个变量被初始化为值 1, 表示设备确实可用。`open` 调用递减并测试 `scull_s_available` 并拒绝存取如果其他人已经使设备打开。
+
+~~~c
+/************************************************************************
+ *
+ * The first device is the single-open one,
+ *  it has an hw structure and an open count
+ */
+
+static struct scull_dev scull_s_device;
+static atomic_t scull_s_available = ATOMIC_INIT(1);
+
+static int scull_s_open(struct inode *inode, struct file *filp)
+{
+	struct scull_dev *dev = &scull_s_device; /* device information */
+
+	if (! atomic_dec_and_test (&scull_s_available)) {
+		atomic_inc(&scull_s_available);
+		return -EBUSY; /* already open */
+	}
+
+	/* then, everything else is copied from the bare scull device */
+	if ( (filp->f_flags & O_ACCMODE) == O_WRONLY)
+		scull_trim(dev);
+	filp->private_data = dev;
+	return 0;          /* success */
+}
+~~~
+
+release 调用, 另一方面, 标识设备为不再忙:
+
+~~~c
+static int scull_s_release(struct inode *inode, struct file *filp)
+{
+	atomic_inc(&scull_s_available); /* release the device */
+	return 0;
+}
+~~~
+
+正常地, 我们建议你将 `open` 标志 `scul_s_available` 放在设备结构中( `scull_dev` 这里)。因为, 从概念上它属于这个设备。scull 驱动, 但是使用独立的变量来保持这个标志, 因此它可使用和空 scull 设备同样的设备结构和方法, 并且最少的代码复制。
+
+
+
+### 6.6.2 一次对一个用户限制存取
+
+单打开设备之外的下一步是使一个用户在多个进程中打开一个设备, 但是一次只允许一个用户打开设备。这个解决方案使得容易测试设备, 因为用户一次可从几个进程读写, 但是假定这个用户负责维护在多次存取中的数据完整性。这通过在 `open` 方法中添加检查来实现; 这样的检查在通常的许可检查后进行, 并且只能使存取更加严格, 比由拥有者和组许可位所指定的限制。这是和 `ttys` 所用的存取策略是相同的, 但是它不依赖于外部的特权程序。
+
+这些存取策略实现地有些比单打开策略要奇怪。在这个情况下, 需要 2 项: 一个打开计数和设备拥有者 `uid`。再一次, 给这个项的最好的地方是在设备结构中; 我们的例子使用全局变量代替, 是因为之前为 scullsingle 所解释的的原因。这个设备的名子是sculluid。
+
+`open` 调用在第一次打开时同意了存取但是记住了设备拥有者. 这意味着一个用户可打开设备多次, 因此允许协调多个进程对设备并发操作. 同时, 没有其他用户可打开它, 这样避免了外部干扰. 因为这个函数版本几乎和之前的一致, 这样相关的部分在这里被复制:
+
+~~~c
+/************************************************************************
+ *
+ * Next, the "uid" device. It can be opened multiple times by the
+ * same user, but access is denied to other users if the device is open
+ */
+
+static struct scull_dev scull_u_device;
+static int scull_u_count;	/* initialized to 0 by default */
+static uid_t scull_u_owner;	/* initialized to 0 by default */
+static DEFINE_SPINLOCK(scull_u_lock);
+
+static int scull_u_open(struct inode *inode, struct file *filp)
+{
+	struct scull_dev *dev = &scull_u_device; /* device information */
+
+	spin_lock(&scull_u_lock);
+	if (scull_u_count && 
+	                (scull_u_owner != current_uid().val) &&  /* allow user */
+	                (scull_u_owner != current_euid().val) && /* allow whoever did su */
+			!capable(CAP_DAC_OVERRIDE)) { /* still allow root */
+		spin_unlock(&scull_u_lock);
+		return -EBUSY;   /* -EPERM would confuse the user */
+	}
+
+	if (scull_u_count == 0)
+		scull_u_owner = current_uid().val; /* grab it */
+
+	scull_u_count++;
+	spin_unlock(&scull_u_lock);
+
+/* then, everything else is copied from the bare scull device */
+
+	if ((filp->f_flags & O_ACCMODE) == O_WRONLY)
+		scull_trim(dev);
+	filp->private_data = dev;
+	return 0;          /* success */
+}
+
+~~~
+
+注意 sculluid 代码有 2 个变量 ( `scull_u_owner` 和 `scull_u_count`)来控制对设备的存取, 并且这样可被多个进程并发地存取。为使这些变量安全, 我们使用一个自旋锁控制对它们的存取( `scull_u_lock` )。没有这个锁, 2 个(或多个)进程可同时测试`scull_u_count` , 并且都可能认为它们拥有设备的拥有权。这里使用一个自旋锁, 是因为这个锁被持有极短的时间, 并且驱动在持有这个锁时不做任何可睡眠的事情。
+
+我们选择返回 `-EBUSY` 而不是 `-EPERM`, 即便这个代码在进行许可检测, 为了给一个被拒绝存取的用户指出正确的方向。对于"许可拒绝"的反应常常是检查 `/dev` 文件的模式和拥有者, 而"设备忙"正确地建议用户应当寻找一个已经在使用设备的进程。这个代码也检查来看是否正在试图打开的进程有能力来覆盖文件存取许可; 如果是这样,`open` 被允许即便打开进程不是设备的拥有者。`CAP_DAC_OVERRIDE` 能力在这个情况中适合这个任务。`release` 方法看来如下:
+
+~~~c
+static int scull_u_release(struct inode *inode, struct file *filp)
+{
+	spin_lock(&scull_u_lock);
+	scull_u_count--; /* nothing else */
+	spin_unlock(&scull_u_lock);
+	return 0;
+}
+~~~
+
+再次, 我们在修改计数之前必须获得锁, 来确保我们没有和另一个进程竞争。
+
+
+
+### 6.6.3 阻塞 open 作为对 EBUSY 的替代
+
+当设备不可存取, 返回一个错误常常是最合理的方法, 但是有些情况用户可能更愿意等待设备。例如, 如果一个数据通讯通道既用于规律地预期地传送报告(使用 crontab), 也用于根据用户的需要偶尔地使用, 对于被安排的操作最好是稍微延迟, 而不是只是因为通道当前忙而失败。
+
+这是程序员在设计一个设备驱动时必须做的一个选择之一, 并且正确的答案依赖正被解决的实际问题。对 `EBUSY` 的替代, 如同你可能已经想到的, 是实现阻塞 `open`。scullwuid 设备是一个在打开时等待设备而不是返回 `-EBUSY` 的 sculluid 版本。它不同于 sculluid 只在下面的打开操作部分:
+
+~~~c
+/************************************************************************
+ *
+ * Next, the device with blocking-open based on uid
+ */
+
+static struct scull_dev scull_w_device;
+static int scull_w_count;	/* initialized to 0 by default */
+static uid_t scull_w_owner;	/* initialized to 0 by default */
+static DECLARE_WAIT_QUEUE_HEAD(scull_w_wait);
+static DEFINE_SPINLOCK(scull_w_lock);
+
+static inline int scull_w_available(void)
+{
+	return scull_w_count == 0 ||
+		scull_w_owner == current_uid().val ||
+		scull_w_owner == current_euid().val ||
+		capable(CAP_DAC_OVERRIDE);
+}
+
+
+static int scull_w_open(struct inode *inode, struct file *filp)
+{
+	struct scull_dev *dev = &scull_w_device; /* device information */
+
+	spin_lock(&scull_w_lock);
+	while (! scull_w_available()) {
+		spin_unlock(&scull_w_lock);
+		if (filp->f_flags & O_NONBLOCK) return -EAGAIN;
+		if (wait_event_interruptible (scull_w_wait, scull_w_available()))
+			return -ERESTARTSYS; /* tell the fs layer to handle it */
+		spin_lock(&scull_w_lock);
+	}
+	if (scull_w_count == 0)
+		scull_w_owner = current_uid().val; /* grab it */
+	scull_w_count++;
+	spin_unlock(&scull_w_lock);
+
+	/* then, everything else is copied from the bare scull device */
+	if ((filp->f_flags & O_ACCMODE) == O_WRONLY)
+		scull_trim(dev);
+	filp->private_data = dev;
+	return 0;          /* success */
+}
+
+~~~
+
+这个实现再次基于一个等待队列。如果设备当前不可用, 试图打开它的进程被放置到等待队列直到拥有进程关闭设备。`release` 方法。接着, 负责唤醒任何挂起的进程:
+
+~~~c
+static int scull_w_release(struct inode *inode, struct file *filp)
+{
+	int temp;
+
+	spin_lock(&scull_w_lock);
+	scull_w_count--;
+	temp = scull_w_count;
+	spin_unlock(&scull_w_lock);
+
+	if (temp == 0)
+		wake_up_interruptible_sync(&scull_w_wait); /* awake other uid's */
+	return 0;
+}
+~~~
+
+这是一个例子, 这里调用 `wake_up_interruptible_sync` 是有意义的。当我们做这个唤醒,我们只是要返回到用户空间, 这对于系统是一个自然的调度点。当我们做这个唤醒时不是潜在地重新调度, 最好只是调用 "`sync`" 版本并且完成我们的工作。
+
+阻塞式打开实现的问题是对于交互式用户真的不好, 他们不得不猜想哪里出错了。交互式用户常常调用标准命令, 例如 `cp` 和 `tar`, 并且不能增加 `O_NONBLOCK` 到 `open` 调用。有些使用磁带驱动器做备份的人可能喜欢有一个简单的"设备或者资源忙"消息, 来替代被扔在一边猜为什么今天的硬盘驱动器这么安静, 此时 `tar` 应当在扫描它。
+
+这类的问题(需要一个不同的, 不兼容的策略对于同一个设备)最好通过为每个存取策略实现一个设备节点来实现。这个做法的一个例子可在 linux 磁带驱动中找到, 它提供了多个设备文件给同一个设备。例如, 不同的设备文件将使驱动器使用或者不用压缩记录, 或者自动回绕磁带当设备被关闭时。
+
+
+
+
+
+
+
+
+
+
 
 
 
