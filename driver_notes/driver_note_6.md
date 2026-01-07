@@ -3089,33 +3089,330 @@ static int scull_w_release(struct inode *inode, struct file *filp)
 
 
 
+### 6.6.4 在 open 时复制设备
 
+管理存取控制的另一个技术是创建设备的不同的私有拷贝, 根据打开它的进程。明显地, 这只当设备没有绑定到一个硬件实体时有可能; scull 是一个这样的"软件"设备的例子。`/dev/tty` 的内部使用类似的技术来给它的进程一个不同的 `/dev` 入口点呈现的视图。当设备的拷贝被软件驱动创建, 我们称它们为虚拟设备--就象虚拟控制台使用一个物理 `tty` 设备.结构这类的存取控制很少需要, 这个实现可说明内核代码是多么容易改变应用程序的对周围世界的看法(即, 计算机)。
 
+`/dev/scullpriv` 设备节点在 scull 软件包只实现虚拟设备。scullpriv 实现使用了进程的控制 `tty` 的设备号作为对存取虚拟设备的钥匙。但是, 你可以轻易地改变代码来使用任何整数值作为钥匙; 每个选择都导致一个不同的策略。例如, 使用 `uid` 导致一个不同地虚拟设备给每个用户, 而使用一个 `pid` 钥匙创建一个新设备为每个存取它的进程。
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+使用控制终端的决定打算用在易于使用 `I/O` 重定向测试设备: 设备被所有的在同一个虚拟终端运行的命令所共享, 并且保持独立于在另一个终端上运行的命令所见到的。`open` 方法看来象下面的代码。它必须寻找正确的虚拟设备并且可能创建一个。这个函数的最后部分没有展示, 因为它拷贝自空的 scull, 我们已经见到过。
 
 ~~~c
+/************************************************************************
+ *
+ * Finally the `cloned' private device. This is trickier because it
+ * involves list management, and dynamic allocation.
+ */
+
+/* The clone-specific data structure includes a key field */
+
+struct scull_listitem {
+	struct scull_dev device;
+	dev_t key;
+	struct list_head list;
+    
+};
+
+/* The list of devices, and a lock to protect it */
+static LIST_HEAD(scull_c_list);
+static DEFINE_SPINLOCK(scull_c_lock);
+
+/* A placeholder scull_dev which really just holds the cdev stuff. */
+static struct scull_dev scull_c_device;   
+
+/* Look for a device or create one if missing */
+static struct scull_dev *scull_c_lookfor_device(dev_t key)
+{
+	struct scull_listitem *lptr;
+
+	list_for_each_entry(lptr, &scull_c_list, list) {
+		if (lptr->key == key)
+			return &(lptr->device);
+	}
+
+	/* not found */
+	lptr = kmalloc(sizeof(struct scull_listitem), GFP_KERNEL);
+	if (!lptr)
+		return NULL;
+
+	/* initialize the device */
+	memset(lptr, 0, sizeof(struct scull_listitem));
+	lptr->key = key;
+	scull_trim(&(lptr->device)); /* initialize it */
+	mutex_init(&lptr->device.lock);
+
+	/* place it in the list */
+	list_add(&lptr->list, &scull_c_list);
+
+	return &(lptr->device);
+}
+
+static int scull_c_open(struct inode *inode, struct file *filp)
+{
+	struct scull_dev *dev;
+	dev_t key;
+ 
+	if (!current->signal->tty) { 
+		PDEBUG("Process \"%s\" has no ctl tty\n", current->comm);
+		return -EINVAL;
+	}
+	key = tty_devnum(current->signal->tty);
+
+	/* look for a scullc device in the list */
+	spin_lock(&scull_c_lock);
+	dev = scull_c_lookfor_device(key);
+	spin_unlock(&scull_c_lock);
+
+	if (!dev)
+		return -ENOMEM;
+
+	/* then, everything else is copied from the bare scull device */
+	if ( (filp->f_flags & O_ACCMODE) == O_WRONLY)
+		scull_trim(dev);
+	filp->private_data = dev;
+	return 0;          /* success */
+}
+
 
 ~~~
 
-> 1
+这个 `release `方法没有做特殊的事情。它将在最后的关闭时正常地释放设备, 但是我们不选择来维护一个 `open` 计数而来简化对驱动的测试。如果设备在最后的关闭被释放, 你将不能读相同的数据在写入设备之后, 除非一个后台进程将保持它打开。例子驱动采用了简单的方法来保持数据, 以便在下一次打开时, 你会发现它在那里。设备在`scull_cleanup` 被调用时释放。这个代码使用通用的 linux 链表机制, 而不是从头开始实现相同的功能。linux 链表在第 11 章中讨论.这里是 `/dev/scullpriv` 的 `release` 实现, 它结束了对设备方法的讨论。
+
+~~~c
+static int scull_c_release(struct inode *inode, struct file *filp)
+{
+	/*
+	 * Nothing to do, because the device is persistent.
+	 * A `real' cloned device should be freed on last close
+	 */
+	return 0;
+}
+~~~
+
+
+
+## 6.7 快速参考
+
+本章介绍了下面的符号和头文件:
+
+~~~c
+#include <linux/ioctl.h>
+~~~
+
+> 声明用来定义 `ioctl` 命令的宏定义。当前被 `<linux/fs.h>` 包含。
 
 ------------------------
+
+~~~c
+_IOC_NRBITS
+_IOC_TYPEBITS
+_IOC_SIZEBITS
+_IOC_DIRBITS
+~~~
+
+> `ioctl` 命令的不同位段所使用的位数。还有 4 个宏来指定 `MASK` 和 4 个指定`SHIFT`, 但是它们主要是给内部使用。 `_IOC_SIZEBIT` 是一个要检查的重要的值, 因为它跨体系改变。
+
+------------------------
+
+~~~c
+_IOC_NONE
+_IOC_READ
+_IOC_WRITE
+~~~
+
+> "方向"位段可能的值。 "`read`" 和 "`write`" 是不同的位并且可相或来指定`read/write`。这些值是基于 0 的。
+
+------------------------
+
+~~~c
+_IOC(dir,type,nr,size)
+_IO(type,nr)
+_IOR(type,nr,size)
+_IOW(type,nr,size)
+_IOWR(type,nr,size)
+~~~
+
+> 用来创建 ioclt 命令的宏定义。
+
+------------------------
+
+~~~c
+_IOC_DIR(nr)
+_IOC_TYPE(nr)
+_IOC_NR(nr)
+_IOC_SIZE(nr)
+~~~
+
+> 用来解码一个命令的宏定义。特别地, `_IOC_TYPE(nr)` 是 `_IOC_READ` 和 `_IOC_WRITE` 的 `OR` 结合。
+
+------------------------
+
+~~~c
+#include <asm/uaccess.h>
+int access_ok(int type, const void *addr, unsigned long size);
+~~~
+
+> 检查一个用户空间的指针是可用的。`access_ok` 返回一个非零值, 如果应当允许存取。
+
+------------------------
+
+~~~c
+VERIFY_READ
+VERIFY_WRITE
+~~~
+
+> `access_ok` 中 `type` 参数的可能取值。 `VERIFY_WRITE` 是 `VERIFY_READ` 的超集。
+
+------------------------
+
+~~~c
+#include <asm/uaccess.h>
+int put_user(datum,ptr);
+int get_user(local,ptr);
+int __put_user(datum,ptr);
+int __get_user(local,ptr);
+~~~
+
+> 用来存储或获取一个数据到或从用户空间的宏。传送的字节数依赖 `sizeof(*ptr)`。常规的版本调用 `access_ok` , 而常规版本( `__put_user` 和 `__get_user` ) 假定`access_ok` 已经被调用了。
+
+------------------------
+
+~~~c
+#include <linux/capability.h>
+~~~
+
+> 定义各种 `CAP_ ` 符号, 描述一个用户空间进程可有的能力。
+
+------------------------
+
+~~~c
+int capable(int capability);
+~~~
+
+> 返回非零值如果进程有给定的能力。
+
+------------------------
+
+~~~c
+#include <linux/wait.h>
+typedef struct { /* ... */ } wait_queue_head_t;
+void init_waitqueue_head(wait_queue_head_t *queue);
+DECLARE_WAIT_QUEUE_HEAD(queue);
+~~~
+
+> Linux 等待队列的定义类型。 一个 `wait_queue_head_t` 必须被明确在运行时使用`init_waitqueue_head` 或者编译时使用 `DEVLARE_WAIT_QUEUE_HEAD` 进行初始化。
+
+------------------------
+
+~~~c
+void wait_event(wait_queue_head_t q, int condition);
+int wait_event_interruptible(wait_queue_head_t q, int condition);
+int wait_event_timeout(wait_queue_head_t q, int condition, int time);
+int wait_event_interruptible_timeout(wait_queue_head_t q, int condition,
+                                     int time);
+~~~
+
+> 使进程在给定队列上睡眠, 直到给定条件值为真值。
+
+------------------------
+
+~~~c
+void wake_up(struct wait_queue **q);
+void wake_up_interruptible(struct wait_queue **q);
+void wake_up_nr(struct wait_queue **q, int nr);
+void wake_up_interruptible_nr(struct wait_queue **q, int nr);
+void wake_up_all(struct wait_queue **q);
+void wake_up_interruptible_all(struct wait_queue **q);
+void wake_up_interruptible_sync(struct wait_queue **q);
+~~~
+
+> 唤醒在队列 q 上睡眠的进程。 `_interruptible` 的形式只唤醒可中断的进程. 正常地, 只有一个互斥等待者被唤醒, 但是这个行为可被 `_nr` 或者 `_all` 形式所改变。`_sync` 版本在返回之前不重新调度 CPU。
+
+------------------------
+
+~~~c
+#include <linux/sched.h>
+set_current_state(int state);
+~~~
+
+> 设置当前进程的执行状态。`TASK_RUNNING` 意味着它已经运行, 而睡眠状态是`TASK_INTERRUPTIBLE` 和 `TASK_UNINTERRUPTIBLE`。
+
+------------------------
+
+~~~c
+void schedule(void);
+~~~
+
+> 选择一个可运行的进程从运行队列中. 被选中的进程可是当前进程或者另外一个。
+
+------------------------
+
+~~~c
+typedef struct { /* ... */ } wait_queue_t;
+init_waitqueue_entry(wait_queue_t *entry, struct task_struct *task);
+~~~
+
+> `wait_queue_t` 类型用来放置一个进程到一个等待队列。
+
+------------------------
+
+~~~c
+void prepare_to_wait(wait_queue_head_t *queue, wait_queue_t *wait, int state);
+void prepare_to_wait_exclusive(wait_queue_head_t *queue, wait_queue_t *wait,
+int state);
+void finish_wait(wait_queue_head_t *queue, wait_queue_t *wait);
+~~~
+
+> 帮忙函数, 可用来编码一个手工睡眠。
+
+------------------------
+
+~~~c
+void sleep_on(wiat_queue_head_t *queue);
+void interruptible_sleep_on(wiat_queue_head_t *queue);
+~~~
+
+> 老式的不推荐的函数, 它们无条件地使当前进程睡眠。
+
+------------------------
+
+~~~c
+#include <linux/poll.h>
+void poll_wait(struct file *filp, wait_queue_head_t *q, poll_table *p);
+~~~
+
+> 将当前进程放入一个等待队列, 不立刻调度。它被设计来被设备驱动的 `poll` 方法使用。
+
+------------------------
+
+~~~c
+int fasync_helper(struct inode *inode, struct file *filp, int mode, 
+                  struct fasync_struct **fa);
+~~~
+
+> 一个"帮忙者", 来实现 `fasync` 设备方法。`mode` 参数是传递给方法的相同的值。而 `fa` 指针指向一个设备特定的 `fasync_struct *`。
+
+------------------------
+
+~~~c
+void kill_fasync(struct fasync_struct *fa, int sig, int band);
+~~~
+
+> 如果这个驱动支持异步通知, 这个函数可用来发送一个信号到登记在 `fa` 中的进程。
+
+------------------------
+
+~~~c
+int nonseekable_open(struct inode *inode, struct file *filp);
+loff_t no_llseek(struct file *file, loff_t offset, int whence);
+~~~
+
+> nonseekable_open 应当在任何不支持移位的设备的 open 方法中被调用。这样的设备应当使用 no_llseek 作为它们的 llseek 方法。
+
+------------------------
+
+
+
+# END
+
 
