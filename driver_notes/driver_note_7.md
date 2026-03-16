@@ -1724,47 +1724,1542 @@ wait_event_interruptible(data->wait, !data->loops);
 
 由内核开发者想出的解决方法是基于一个`每个CPU` 数据结构。这个 `timer_list` 结构包括一个指针指向这个的数据结构在它的 `base` 成员。如果 `base` 是 `NULL`, 这个定时器没有被调用运行; 否则, 这个指针告知哪个数据结构(并且, 因此, 哪个 CPU )运行它。`每个CPU` 数据项在第 8 章的"每个CPU 变量"一节中描述。
 
+无论何时内核代码注册一个定时器( 通过 `add_timer` 或者 `mod_timer`), 操作最终由`internal_add_timer` 进行( 在`kernel/timer.c`), 它依次添加新定时器到一个双向定时器链表在一个关联到当前 CPU 的"层叠表" 中。这个层叠表象这样工作: 如果定时器在下一个 `0` 到 `255 jiffies` 内到时, 它被添加到专供短时定时器 256 列表中的一个上, 使用 `expires` 成员的最低有效位。如果它在将来更久时间到时( 但是在 `16,384 jiffies `之前 ), 它被添加到基于 `expires` 成员的 9 - 14位的 64 个列表中一个。对于更长的定时器, 同样的技巧用在 15 - 20 位, 21 - 26 位,和 27 - 31 位。带有一个指向将来还长时间的 expires 成员的定时器( 一些只可能发生在 64-位 平台上的事情 ) 被使用一个延时值 0xffffffff 进行哈希处理, 并且带有在过去到时的定时器被调度来在下一个时钟嘀哒运行。(一个已经到时的定时器模拟有时在高负载情况下被注册, 特别的是如果你运行一个可抢占内核)。
 
+当触发 `__run_timers`, 它为当前定时器嘀哒执行所有挂起的定时器。如果 `jiffies` 当前是 256 的倍数, 这个函数还重新哈希处理一个下一级别的定时器列表到 256 短期列表,可能地层叠一个或多个别的级别, 根据 `jiffies` 的位表示。
 
+这个方法, 虽然第一眼看去相当复杂, 在几个和大量定时器的时候都工作得很好。用来管理每个激活定时器的时间独立于已经注册的定时器数目并且限制在几个对于它的 `expires`成员的二进制表示的逻辑操作上。关联到这个实现的唯一的开销是给 512 链表头的内存( 256 短期链表和 4 组 64 更长时间的列表) -- 即 4 KB 的容量.
 
+函数 `__run_timers`, 如同 `/proc/jitimer` 所示, 在原子上下文运行。除了我们已经描述过的限制, 这个带来一个有趣的特性: 定时器刚好在合适的时间到时, 甚至你没有运行一个可抢占内核, 并且 CPU 在内核空间忙。你可以见到发生了什么当你在后台读`/proc/jitbusy` 时以及在前台 `/proc/jitimer`。尽管系统看来牢固地被锁住被这个忙等待系统调用, 内核定时器照样工作地不错。
 
-
-
-
-
-
-
-
-
-
+但是, 记住, 一个内核定时器还远未完善, 因为它受累于` jitter` 和 其他由硬件中断引起怪物, 还有其他定时器和其他异步任务。虽然一个关联到简单数字 `I/O` 的定时器对于一个如同运行一个步进马达或者其他业余电子设备等简单任务是足够的, 它常常是不合适在工业环境中的生产系统。对于这样的任务, 你将最可能需要依赖一个实时内核扩展。
 
 -------------------------
 
-
-
 **现代Linux的实现方法**
 
+现代 Linux（5.x / 6.x）内核中的**定时器实现机制**相比《Linux Device Drivers》时代已经有明显演进。LDD3 主要描述的是 **早期 timer wheel + jiffies** 的模型，而现代内核在结构、扩展性和高精度支持方面做了很多改进。
 
+下面从 **整体架构 → 核心数据结构 → 工作流程 → 与旧实现差异** 逐步说明。
 
+**一、现代 Linux 定时器体系结构**
 
+现代内核的定时器系统实际上分为两类：
 
+```
+Linux Timer Subsystem
+│
+├─ Low resolution timer
+│   └─ timer_list（传统 jiffies 定时器）
+│
+└─ High resolution timer
+    └─ hrtimer（纳秒级高精度）
+```
 
+两者分工：
 
+| 类型       | 精度      | 使用场景     |
+| ---------- | --------- | ------------ |
+| timer_list | jiffies级 | 普通内核延迟 |
+| hrtimer    | ns级      | 高精度调度   |
 
-
-
-
-
-
-
-
-
-
-~~~c
-
-~~~
-
-> 1
+很多驱动仍然使用 **timer_list**。
 
 ------------------------
+
+**二、timer_list 的核心实现：分层时间轮**
+
+现代 Linux 使用 **Hierarchical Timing Wheel（分层时间轮）**。
+
+结构类似：
+
+```
+Level 0  256 slots
+Level 1  64 slots
+Level 2  64 slots
+Level 3  64 slots
+Level 4  64 slots
+```
+
+每个 slot 是一个链表：
+
+```
+slot[i] → timer → timer → timer
+```
+
+时间轮结构示意：
+
+```
+                Level 4
+               ┌───────┐
+               │ slots │
+               └───────┘
+                   ↑
+               Level 3
+                   ↑
+               Level 2
+                   ↑
+               Level 1
+                   ↑
+               Level 0  (当前tick)
+```
+
+**为什么这样设计**, 目的：
+
+- O(1) 插入定时器
+- O(1) 删除定时器
+- 减少扫描成本
+- 支持大量定时器
+
+这是 Linux 高性能的重要设计之一。
+
+-------------
+
+**三、每 CPU 定时器队列**
+
+现代内核使用 **per-CPU timer base**。结构：
+
+```
+CPU0
+ └─ timer_base
+     └─ timing wheel
+
+CPU1
+ └─ timer_base
+     └─ timing wheel
+```
+
+优点：
+
+- 减少锁竞争
+- 提高 SMP 性能
+- 定时器通常在本 CPU 运行
+
+核心结构（简化）：
+
+```c
+struct timer_base {
+    spinlock_t lock;
+    struct hlist_head vectors[LVL_DEPTH][LVL_SIZE];
+    unsigned long clk;
+};
+```
+
+-----------
+
+**四、timer_list 数据结构**
+
+现代版本（简化）：
+
+```c
+struct timer_list {
+    struct hlist_node entry;
+    unsigned long expires;
+    void (*function)(struct timer_list *);
+    u32 flags;
+};
+```
+
+关键字段：
+
+| 字段     | 作用       |
+| -------- | ---------- |
+| entry    | 链入时间轮 |
+| expires  | 触发时间   |
+| function | 回调函数   |
+| flags    | 定时器属性 |
+
+------------
+
+**五、定时器触发流程**
+
+整体流程如下：
+
+```
+硬件时钟中断
+        │
+        ▼
+tick interrupt
+        │
+        ▼
+run_local_timers()
+        │
+        ▼
+timer softirq
+        │
+        ▼
+__run_timers()
+        │
+        ▼
+执行 timer callback
+```
+
+更完整流程：
+
+```
+clock interrupt
+   │
+   ▼
+update_process_times()
+   │
+   ▼
+run_local_timers()
+   │
+   ▼
+raise_softirq(TIMER_SOFTIRQ)
+   │
+   ▼
+run_timer_softirq()
+   │
+   ▼
+__run_timers()
+   │
+   ▼
+call_timer_fn()
+```
+
+因此：**定时器回调运行在 softirq 上下文。**
+
+------------------------
+
+**六、定时器插入算法**
+
+当调用：
+
+```
+mod_timer(&timer, expires);
+```
+
+内核会：
+
+1. 计算剩余 tick
+2. 选择时间轮层级
+3. 插入对应 slot 链表
+
+伪代码：
+
+```c
+delta = expires - current_time
+
+if delta < 256
+    放入 level0
+else if delta < 2^14
+    放入 level1
+else if ...
+```
+
+这样可以避免扫描大量定时器。
+
+--------------
+
+**七、时间推进机制**
+
+每个 tick：
+
+```
+current_time++
+```
+
+然后：
+
+```
+检查 level0 slot
+执行其中定时器
+```
+
+如果 level0 轮转：
+
+```
+cascade level1
+```
+
+即：
+
+```
+level1 slot → 下移到 level0
+```
+
+这就是 **时间轮级联(cascade)**。
+
+---------------
+
+**八、删除定时器**
+
+删除定时器只需：
+
+```
+从链表移除
+```
+
+因此：
+
+```c
+del_timer()
+```
+
+复杂度：
+
+```
+O(1)
+```
+
+这是 timer wheel 的关键优势。
+
+------------
+
+**九、NO_HZ（tickless）支持**
+
+现代 Linux 支持 **NO_HZ**：
+
+CPU idle 时：
+
+```
+停止 periodic tick
+```
+
+定时器会：
+
+```c
+program next event
+```
+
+即：
+
+```
+下一次最近的 timer
+```
+
+这样可以：
+
+- 节能、减少中断
+
+LDD3 时代没有这个机制。
+
+-----------
+
+**十、定时器回调上下文**
+
+回调运行在：
+
+```
+softirq context
+```
+
+因此，**不能**：
+
+```
+sleep
+schedule
+mutex_lock
+```
+
+允许：
+
+```
+spin_lock
+atomic ops
+wake_up
+```
+
+这和 LDD3 描述基本一致。
+
+--------
+
+**十一、现代新增特性**
+
+现代 timer_list 增加了 flags：
+
+| flag             | 作用          |
+| ---------------- | ------------- |
+| TIMER_DEFERRABLE | idle 时不唤醒 |
+| TIMER_PINNED     | 绑定 CPU      |
+| TIMER_IRQSAFE    | IRQ safe      |
+
+示例：
+
+```c
+timer_setup(&timer, func, TIMER_DEFERRABLE);
+```
+
+-------------
+
+**十二、与 LDD3 实现差异总结**
+
+| 项目        | LDD3       | 现代 Linux  |
+| ----------- | ---------- | ----------- |
+| timer wheel | 有         | 改进版      |
+| CPU 模型    | 全局       | per-CPU     |
+| tick 模型   | periodic   | 支持 NO_HZ  |
+| API         | init_timer | timer_setup |
+| 高精度      | 无         | hrtimer     |
+| flags       | 无         | 有          |
+
+------
+
+**十三、一句话总结**
+
+现代 Linux 定时器的核心思想仍然是：
+
+> **基于 jiffies 的分层时间轮 + per-CPU 队列 + softirq 执行回调**
+
+但实现已经增加：
+
+- per-CPU timer base、NO_HZ tickless、高精度 hrtimer、更安全的 API
+
+
+
+## 7.5 Tasklets 机制
+
+另一个有关于定时问题的内核设施是 tasklet 机制。它大部分用在中断管理(我们将在第10 章再次见到)。
+
+`tasklet` 类似内核定时器在某些方面。它们一直在中断时间运行, 它们一直运行在调度它们的同一个 CPU 上, 并且它们接收一个 `unsigned long` 参数。不象内核定时器, 但是,你无法请求在一个指定的时间执行函数。通过调度一个 `tasklet`, 你简单地请求它在以后的一个由内核选择的时间执行。这个行为对于中断处理特别有用, 那里硬件中断必须被尽快处理, 但是大部分的时间管理可以安全地延后到以后的时间。实际上, 一个` tasklet`,就象一个内核定时器, 在一个"软中断"的上下文中执行(以原子模式), 在使能硬件中断时执行异步任务的一个内核机制。一个`tasklet` 存在为一个时间结构, 它必须在使用前被初始化。初始化能够通过调用一个特定函数或者通过使用某些宏定义声明结构:
+
+~~~c
+#include <linux/interrupt.h>
+struct tasklet_struct {
+/* ... */
+void (*func)(unsigned long);
+	unsigned long data;
+};
+void tasklet_init(struct tasklet_struct *t,
+void (*func)(unsigned long), unsigned long data);
+DECLARE_TASKLET(name, func, data);
+DECLARE_TASKLET_DISABLED(name, func, data);
+~~~
+
+`tasklet` 提供了许多有趣的特色:
+
+* 一个 `tasklet` 能够被禁止并且之后被重新使能; 它不会执行直到它被使能与被禁止相同的的次数.
+* 如同定时器, 一个 `tasklet` 可以注册它自己.
+* 一个 `tasklet` 能被调度来执行以正常的优先级或者高优先级. 后一组一直是首先执行.
+* `tasklet` 可能立刻运行, 如果系统不在重载下, 但是从不会晚于下一个时钟嘀哒.一个 `tasklet` 可能和其他 `tasklet` 并发, 但是对它自己是严格地串行的 -- 同样的 `tasklet` 从不同时运行在超过一个处理器上. 同样, 如已经提到的, 一个 `tasklet` 常常在调度它的同一个 CPU 上运行.
+
+`jit` 模块包括 2 个文件, `/proc/jitasklet` 和 `/proc/jitasklethi`, 它返回和在"内核定时器"一节中介绍过的 `/proc/jitimer` 同样的数据. 当你读其中一个文件时, 你取回一个`header` 和 `sixdata` 行。第一个数据行描述了调用进程的上下文, 并且其他的行描述了一个 `tasklet` 过程连续运行的上下文。这是一个在编译一个内核时的运行例子:
+
+~~~c
+void tasklet_disable(struct tasklet_struct *t);
+~~~
+
+> 这个函数禁止给定的 `tasklet`。 `tasklet` 可能仍然被 `tasklet_schedule` 调度, 但是它的执行被延后直到这个 `tasklet` 被再次使能。如果这个 `tasklet` 当前在运行,这个函数忙等待直到这个`tasklet` 退出; 因此, 在调用 `tasklet_disable` 后, 你可以确保这个 `tasklet` 在系统任何地方都不在运行。
+
+------------------------
+
+~~~c
+void tasklet_disable_nosync(struct tasklet_struct *t);
+~~~
+
+> 禁止这个 `tasklet`, 但是没有等待任何当前运行的函数退出。当它返回, 这个`tasklet` 被禁止并且不会在以后被调度直到重新使能, 但是它可能仍然运行在另一个 CPU 当这个函数返回时。
+
+------------------------
+
+~~~c
+void tasklet_enable(struct tasklet_struct *t);
+~~~
+
+> 使能一个之前被禁止的 `tasklet`。如果这个 `tasklet` 已经被调度, 它会很快运行。一个对 `tasklet_enable` 的调用必须匹配每个对 `tasklet_disable` 的调用, 因为内核跟踪每个 `tasklet` 的"禁止次数"。
+
+------------------------
+
+~~~c
+void tasklet_schedule(struct tasklet_struct *t);
+~~~
+
+> 调度 `tasklet` 执行。如果一个 `tasklet` 被再次调度在它有机会运行前, 它只运行一次。但是, 如果他在运行中被调度, 它在完成后再次运行; 这保证了在其他事件被处理当中发生的事件收到应有的注意。这个做法也允许一个 `tasklet` 重新调度它自己。
+
+------------------------
+
+~~~c
+void tasklet_hi_schedule(struct tasklet_struct *t);
+~~~
+
+> 调度 `tasklet` 在更高优先级执行。当软中断处理运行时, 它处理高优先级`tasklet` 在其他软中断之前, 包括"正常的" `tasklet`。理想地, 只有具有低响应周期要求( 例如填充音频缓冲 )应当使用这个函数, 为避免其他软件中断处理引入的附加周期。实际上, `/proc/jitasklethi` 没有显示可见的与 `/proc/jitasklet` 的区别。
+
+------------------------
+
+~~~c
+void tasklet_kill(struct tasklet_struct *t);
+~~~
+
+> 这个函数确保了这个 tasklet 没被再次调度来运行; 它常常被调用当一个设备正被关闭或者模块卸载时. 如果这个 tasklet 被调度来运行, 这个函数等待直到它已执行. 如果这个 tasklet 重新调度它自己, 你必须阻止在调用 tasklet_kill 前它重新调度它自己, 如同使用 del_timer_sync.
+
+------------------------
+
+`tasklet` 在 `kernel/softirq.c` 中实现。2 个 tasklet 链表( 正常和高优先级 )被声明为每-CPU 数据结构, 使用和内核定时器相同的 CPU-亲和 机制。在 `tasklet` 管理中的数据结构是简单的链表, 因为 `tasklet` 没有内核定时器的分类请求。
+
+----------------
+
+现代 Linux 内核里 **tasklet** 机制其实已经逐步被“边缘化”，很多子系统正在改用 **workqueue** 或 **softirq + threaded context**。如果你对比 **DDL3**（很多厂商内部系统里也叫 DDL3 的延迟执行模型），会发现 Linux 的 tasklet 在设计理念上和早期 DDL3 的 **deferred execution** 很像，但实现和演进差别比较大。
+
+**一、Linux Tasklet 本质**
+
+**Tasklet = 基于 SoftIRQ 的轻量级延迟执行机制**
+
+它解决的问题：
+
+```
+硬中断 (IRQ)
+    ↓
+不能做耗时工作
+    ↓
+延迟执行
+    ↓
+tasklet / softirq / workqueue
+```
+
+执行层级：
+
+```
+Hard IRQ
+   ↓
+SoftIRQ
+   ↓
+Tasklet
+```
+
+所以 **tasklet其实是softirq的一个封装层**。
+
+内核里有两个固定的 softirq：
+
+```c
+TASKLET_SOFTIRQ
+HI_SOFTIRQ
+```
+
+对应两个队列：
+
+```c
+tasklet_vec[]
+tasklet_hi_vec[]
+```
+
+-------------
+
+**二、Tasklet 内核结构**
+
+核心结构：
+
+```c
+struct tasklet_struct {
+    struct tasklet_struct *next;
+    unsigned long state;
+    atomic_t count;
+    void (*func)(unsigned long);
+    unsigned long data;
+};
+```
+
+字段作用：
+
+| 字段  | 作用        |
+| ----- | ----------- |
+| next  | 链表        |
+| state | 运行状态    |
+| count | disable计数 |
+| func  | 回调        |
+| data  | 参数        |
+
+------
+
+调度流程，驱动中使用：
+
+```
+tasklet_schedule(&t);
+```
+
+流程：
+
+```
+tasklet_schedule
+      ↓
+__tasklet_schedule
+      ↓
+加入 per-CPU tasklet_vec
+      ↓
+raise_softirq_irqoff(TASKLET_SOFTIRQ)
+      ↓
+softirq 执行
+      ↓
+tasklet_action()
+      ↓
+执行 func()
+```
+
+执行路径：
+
+```
+IRQ
+ ↓
+softirq
+ ↓
+tasklet_action
+ ↓
+tasklet->func()
+```
+
+------------
+
+**三、Linux 6.x 的重要变化**
+
+在 **Linux kernel 5.x ~ 6.x** 中，tasklet 有几个重要变化：
+
+**1 Tasklet 已经被官方标记为 Deprecated**
+
+Linux kernel 文档已经明确：
+
+> **Tasklets are deprecated**
+
+原因：
+
+**① 难以并行**
+
+tasklet 特点：
+
+```
+同一个tasklet不能并行执行
+```
+
+靠 state 锁实现：
+
+```
+TASKLET_STATE_RUN
+```
+
+导致：
+
+```
+SMP扩展性差
+```
+
+------
+
+**② 不可睡眠**
+
+tasklet运行在：
+
+```
+softirq context
+```
+
+限制：
+
+```
+不能sleep
+不能阻塞
+不能调用可能schedule的函数
+```
+
+这在现代驱动里很不方便。
+
+------
+
+**③ RT 内核不兼容**
+
+在 **PREEMPT_RT** 中：
+
+```
+softirq 会线程化
+```
+
+tasklet语义会改变。
+
+------
+
+**2 新驱动推荐使用**
+
+官方建议：
+
+| 旧机制      | 新机制         |
+| ----------- | -------------- |
+| tasklet     | workqueue      |
+| softirq     | threaded irq   |
+| bottom half | kthread worker |
+
+例如：
+
+```
+tasklet → workqueue
+```
+
+------------
+
+**3 内核源码中的变化**
+
+Linux 6.x 仍然保留：
+
+```
+kernel/softirq.c
+```
+
+关键函数：
+
+```
+tasklet_action()
+tasklet_hi_action()
+```
+
+但越来越多驱动删除 tasklet。例如：
+
+```
+network drivers
+wireless drivers
+```
+
+都迁移到：
+
+```
+NAPI
+workqueue
+```
+
+------------
+
+**四、和 DDL3 的区别**
+
+如果你说的 **DDL3 延迟执行模型**（很多嵌入式系统里用），它和 Linux tasklet 很像，但有关键差异：
+
+| 特性        | Linux tasklet     | DDL3         |
+| ----------- | ----------------- | ------------ |
+| 运行层级    | softirq           | 自定义调度   |
+| CPU绑定     | per-CPU           | 通常全局     |
+| 并发        | 同tasklet不可并发 | 通常可并发   |
+| 调度来源    | IRQ               | 任务/ISR     |
+| 是否能sleep | 不能              | 通常可以     |
+| 现代支持    | 逐渐淘汰          | 很多系统仍用 |
+
+------
+
+**典型 DDL3 模型**
+
+一般结构：
+
+```
+ISR
+ ↓
+DDL3 enqueue
+ ↓
+scheduler thread
+ ↓
+deferred function
+```
+
+而 Linux：
+
+```
+ISR
+ ↓
+raise_softirq
+ ↓
+tasklet_action
+ ↓
+callback
+```
+
+关键区别：
+
+```
+DDL3  = thread based
+tasklet = softirq based
+```
+
+-------------
+
+**五、现代 Linux Bottom Half 体系**
+
+现代 Linux 延迟执行层级：
+
+```
+Hard IRQ
+  │
+  ├─ SoftIRQ
+  │     ├─ NET_RX
+  │     ├─ NET_TX
+  │     └─ TASKLET
+  │
+  ├─ Tasklet  (deprecated)
+  │
+  ├─ Workqueue  (推荐)
+  │
+  └─ kthread worker
+```
+
+------
+
+**六、为什么 Linux 不再推荐 Tasklet**
+
+核心原因只有三个：
+
+```
+1 SMP 扩展性差
+2 无法 sleep
+3 RT 不友好
+```
+
+所以现代驱动基本用：
+
+```
+IRQ
+ ↓
+NAPI / threaded IRQ
+ ↓
+workqueue
+```
+
+------
+
+**七、一个真实驱动例子**
+
+旧写法：
+
+```c
+tasklet_schedule(&rx_tasklet);
+```
+
+新写法：
+
+```c
+queue_work(system_wq, &rx_work);
+```
+
+------
+
+
+
+## 7.6 工作队列
+
+工作队列是, 表面上看, 类似于 `taskets`; 它们允许内核代码来请求在将来某个时间调用一个函数。但是, 有几个显著的不同在这 2 个之间, 包括:
+
+* `tasklet` 在软件中断上下文中运行的结果是所有的 `tasklet` 代码必须是原子的.相反, 工作队列函数在一个特殊内核进程上下文运行; 结果, 它们有更多的灵活性。特别地, 工作队列函数能够睡眠。
+
+* `tasklet` 常常在它们最初被提交的处理器上运行。工作队列以相同地方式工作, 缺省地。
+
+* 内核代码可以请求工作队列函数被延后一个明确的时间间隔。
+
+两者之间关键的不同是 `tasklet` 执行的很快, 短时期, 并且在原子态, 而工作队列函数可能有高周期但是不需要是原子的. 每个机制有它适合的情形。
+
+工作队列有一个 `struct workqueue_struct` 类型, 在 `<linux/workqueue.h>` 中定义. 一个工作队列必须明确的在使用前创建, 使用一个下列的 2 个函数:
+
+~~~c
+struct workqueue_struct *create_workqueue(const char *name);
+struct workqueue_struct *create_singlethread_workqueue(const char *name);
+~~~
+
+每个工作队列有一个或多个专用的进程("内核线程"), 它运行提交给这个队列的函数。如果你使用 `create_workqueue`, 你得到一个工作队列它有一个专用的线程在系统的每个处理器上。在很多情况下, 所有这些线程是简单的过度行为; 如果一个单个工作者线程就足够, 使用 `create_singlethread_workqueue` 来代替创建工作队列提交一个任务给一个工作队列, 你需要填充一个 `work_struct` 结构。这可以在编译时完成, 如下:
+
+~~~c
+DECLARE_WORK(name, void (*function)(void *), void *data);
+~~~
+
+这里 `name` 是声明的结构名称, `function` 是从工作队列被调用的函数, 以及 `data` 是一个传递给这个函数的值。如果你需要建立 `work_struct` 结构在运行时, 使用下面 2 个宏定义:
+
+~~~c
+INIT_WORK(struct work_struct *work, void (*function)(void *), void *data);
+PREPARE_WORK(struct work_struct *work, void (*function)(void *), void *data);
+~~~
+
+`INIT_WORK` 做更加全面的初始化结构的工作; 你应当在第一次建立结构时使用它。`PREPARE_WORK` 做几乎同样的工作, 但是它不初始化用来连接 `work_struct` 结构到工作队列的指针。如果有任何的可能性这个结构当前被提交给一个工作队列, 并且你需要改变这个队列, 使用 `PREPARE_WORK` 而不是 `INIT_WORK`。有 2 个函数来提交工作给一个工作队列:
+
+~~~c
+int queue_work(struct workqueue_struct *queue, struct work_struct *work);
+int queue_delayed_work(struct workqueue_struct *queue, struct work_struct
+			*work, unsigned long delay);
+~~~
+
+每个都添加工作到给定的队列。如果使用 `queue_delay_work`, 但是, 实际的工作没有进行直到至少 `delay jiffies` 已过去。从这些函数的返回值是 0 如果工作被成功加入到队列; 一个非零结果意味着这个 `work_struct` 结构已经在队列中等待, 并且第 2 次没有加入。
+
+在将来的某个时间, 这个工作函数将被使用给定的 data 值来调用。这个函数将在工作者线程的上下文运行, 因此它可以睡眠如果需要 -- 尽管你应当知道这个睡眠可能怎样影响提交给同一个工作队列的其他任务。这个函数不能做的是, 但是, 是存取用户空间。因为它在一个内核线程中运行, 完全没有用户空间来存取.如果你需要取消一个挂起的工作队列入口, 你可以调用:
+
+~~~c
+int cancel_delayed_work(struct work_struct *work);
+~~~
+
+返回值是非零如果这个入口在它开始执行前被取消。内核保证给定入口的执行不会在调用`cancel_delay_work` 后被初始化。如果 `cancel_delay_work` 返回 0, 但是, 这个入口可能已经运行在一个不同的处理器, 并且可能仍然在调用 `cancel_delayed_work` 后在运行。要绝对确保工作函数没有在 `cancel_delayed_work` 返回 0 后在任何地方运行, 你必须跟随这个调用来调用:
+
+~~~C
+void flush_workqueue(struct workqueue_struct *queue);
+~~~
+
+在 `flush_workqueue` 返回后, 没有在这个调用前提交的函数在系统中任何地方运行。当你用完一个工作队列, 你可以去掉它, 使用:
+
+~~~c
+void destroy_workqueue(struct workqueue_struct *queue);
+~~~
+
+-------------
+
+**现代 Linux kernel 的 Workqueue 和 DDL3 的“工作队列（work queue）” **。其实两者名字很像，但**设计层级完全不同**。
+
+**一、架构层级区别（最核心）**
+
+**Linux Workqueue 架构**，Linux 是 **内核线程池模型**：
+
+```
+kernel subsystem / driver
+        │
+        ▼
+   queue_work()
+        │
+        ▼
+workqueue_struct
+        │
+        ▼
+per-CPU worker_pool
+        │
+        ▼
+kworker thread
+        │
+        ▼
+work callback
+```
+
+关键特点：
+
+```
+每个 CPU 有 worker pool
+多个 kworker 并行执行
+```
+
+------
+
+**DDL3 工作队列架构**，DDL3 通常是 **调度线程 + 队列模型**：
+
+```
+ISR / task
+    │
+    ▼
+enqueue(work)
+    │
+    ▼
+DDL3 work queue
+    │
+    ▼
+scheduler thread
+    │
+    ▼
+callback
+```
+
+关键特点：
+
+```
+一个或多个调度线程
+从队列取任务执行
+```
+
+------
+
+**二、CPU 并发模型**
+
+**Linux Workqueue**，Linux 内核设计是 **SMP 优化的**：
+
+```
+CPU0 worker_pool
+CPU1 worker_pool
+CPU2 worker_pool
+CPU3 worker_pool
+```
+
+任务执行：
+
+```
+work1 → CPU0
+work2 → CPU1
+work3 → CPU2
+```
+
+优点：
+
+```
+天然支持多核并行
+减少锁竞争
+```
+
+------
+
+**DDL3 工作队列**，通常是：
+
+```
+global queue
+      │
+      ▼
+thread pool
+```
+
+并发能力取决于：
+
+```
+线程数量
+队列锁
+```
+
+缺点：
+
+```
+可能出现锁竞争
+CPU locality 差
+```
+
+------
+
+**三、调度机制**
+
+**Linux Workqueue** 调度函数：
+
+```
+queue_work()
+schedule_work()
+queue_delayed_work()
+```
+
+流程：
+
+```
+queue_work
+   │
+   ▼
+pwq (per cpu workqueue)
+   │
+   ▼
+worker_pool
+   │
+   ▼
+wake_up_worker
+```
+
+延迟任务：
+
+```
+delayed_work
+   │
+timer
+   │
+workqueue
+```
+
+------
+
+**DDL3 工作队列**，调度通常是：
+
+```
+enqueue()
+signal()
+```
+
+执行：
+
+```
+while(true)
+{
+    task = dequeue()
+    run(task)
+}
+```
+
+延迟任务：
+
+```
+timer thread
+   │
+enqueue
+```
+
+------
+
+**四、实时性和阻塞**
+
+**Linux Workqueue**，执行在：
+
+```
+kworker thread
+```
+
+特点：
+
+```
+可以 sleep
+可以阻塞
+不会影响 IRQ
+```
+
+支持：
+
+```
+RT kernel
+CPU affinity
+priority workqueue
+```
+
+------
+
+**DDL3 工作队列**，执行在线程中：
+
+```
+scheduler thread
+```
+
+如果：
+
+```
+task 阻塞
+```
+
+可能：
+
+```
+阻塞整个队列线程
+```
+
+需要开发者自己控制。
+
+------
+
+**五、资源管理**
+
+**Linux Workqueue**，内核自动管理：
+
+```
+worker 数量
+CPU 绑定
+负载均衡
+唤醒策略
+```
+
+关键代码在：
+
+```
+kernel/workqueue.c
+```
+
+自动扩展 worker：
+
+```
+create_worker()
+destroy_worker()
+```
+
+------
+
+**DDL3**，通常开发者要自己管理：
+
+```
+线程池
+队列
+同步锁
+调度策略
+```
+
+灵活但复杂。
+
+------
+
+**六、典型结构对比**
+
+**Linux Workqueue 数据结构**，核心结构：
+
+```
+work_struct
+workqueue_struct
+pool_workqueue
+worker_pool
+worker
+```
+
+关系：
+
+```
+work_struct
+     │
+     ▼
+workqueue_struct
+     │
+     ▼
+pool_workqueue
+     │
+     ▼
+worker_pool
+     │
+     ▼
+worker thread
+```
+
+------
+
+**DDL3 工作队列结构**，一般比较简单：
+
+```
+task_node
+queue
+mutex
+condition
+thread_pool
+```
+
+结构：
+
+```
+task
+ │
+ ▼
+queue
+ │
+ ▼
+thread
+```
+
+------
+
+**七、最本质区别（总结）**
+
+| 特性     | Linux Workqueue     | DDL3 工作队列 |
+| -------- | ------------------- | ------------- |
+| 层级     | 内核调度机制        | 应用/系统框架 |
+| 线程管理 | 内核自动            | 开发者管理    |
+| CPU模型  | per-CPU worker pool | 通常全局队列  |
+| 并发     | 高度并行            | 取决于线程池  |
+| 锁竞争   | 低                  | 可能较高      |
+| 实时控制 | 内核支持            | 依赖实现      |
+
+一句话总结：
+
+```
+Linux Workqueue = SMP 优化的内核线程池
+DDL3 Work Queue = 普通任务队列 + 线程池
+```
+
+------
+
+💡 **一个很多人不知道但非常关键的区别：**
+
+Linux workqueue 里面有一个很复杂但很核心的结构：
+
+```
+pool_workqueue (pwq)
+```
+
+它负责：
+
+```
+workqueue ↔ worker_pool 的映射
+```
+
+这个结构是 **Linux Workqueue 能做到高并发 + 低锁竞争的关键设计**。
+
+----------------
+
+
+
+### 7.6.1 共享队列
+
+一个设备驱动, 在许多情况下, 不需要它自己的工作队列。如果你只偶尔提交任务给队列,简单地使用内核提供的共享的, 缺省的队列可能更有效。如果你使用这个队列, 但是, 你必须明白你将和别的在共享它。从另一个方面说, 这意味着你不应当长时间独占队列(无长睡眠), 并且可能要更长时间它们轮到处理器。
+
+`jiq` ("`just in queue`") 模块输出 2 个文件来演示共享队列的使用。它们使用一个单个`work_struct structure`, 这个结构这样建立:
+
+~~~c
+static struct work_struct jiq_work;
+/* this line is in jiq_init() */
+INIT_WORK(&jiq_work, jiq_print_wq, &jiq_data);
+~~~
+
+当一个进程读 `/proc/jiqwq`, 这个模块不带延迟地初始化一系列通过共享的工作队列的路线。
+
+~~~c
+int schedule_work(struct work_struct *work);
+~~~
+
+注意, 当使用共享队列时使用了一个不同的函数; 它只要求` work_struct `结构作为一个参数。在 `jiq` 中的实际代码看来如此:
+
+~~~c
+prepare_to_wait(&jiq_wait, &wait, TASK_INTERRUPTIBLE);
+schedule_work(&jiq_work);
+schedule();
+finish_wait(&jiq_wait, &wait);
+~~~
+
+这个实际的工作函数打印出一行就象 `jit` 模块所作的, 接着, 如果需要, 重新提交这个`work_structcture` 到工作队列中。在这是 `jiq_print_wq` 全部:
+
+~~~c
+static void jiq_print_wq(void *ptr)
+{
+    struct clientdata *data = (struct clientdata *) ptr;
+    if (! jiq_print (ptr))
+    	return;
+    if (data->delay)
+    	schedule_delayed_work(&jiq_work, data->delay);
+    else
+    	schedule_work(&jiq_work);
+}
+~~~
+
+如果用户在读被延后的设备 (`/proc/jiqwqdelay`), 这个工作函数重新提交它自己在延后的模式, 使用 `schedule_delayed_work`:
+
+~~~c
+int schedule_delayed_work(struct work_struct *work, unsigned long delay);
+~~~
+
+如果你需要取消一个已提交给工作队列的工作入口, 你可以使用 `cancel_delayed_work`,如上面所述. 刷新共享队列需要一个不同的函数, 但是:
+
+~~~c
+void flush_scheduled_work(void);
+~~~
+
+因为你不知道别人谁可能使用这个队列, 你从不真正知道 `flush_schduled_work` 返回可能需要多长时间。
+
+-----------------
+
+**现代 Linux kernel Workqueue** 和 **DDL3 工作队列中的共享队列**，其实这是两种不同的并发设计思想。 核心区别在 **队列是否被多个执行线程共享**。
+
+**一、DDL3 的共享队列（Shared Work Queue）**
+
+DDL3 中常见的是 **共享任务队列**：
+
+结构大致是：
+
+```
+            +-------------+
+            |  Work Queue |
+            +-------------+
+               /   |   \
+              /    |    \
+         Thread1 Thread2 Thread3
+```
+
+执行流程：
+
+```
+task enqueue
+     │
+     ▼
+shared queue
+     │
+     ▼
+worker thread pool
+     │
+     ▼
+dequeue task
+     │
+     ▼
+execute
+```
+
+特点：
+
+1️⃣ **所有线程共享同一个队列**
+2️⃣ 线程竞争队列锁
+3️⃣ 哪个线程抢到锁就执行任务
+
+典型代码逻辑：
+
+```
+lock(queue)
+task = dequeue()
+unlock(queue)
+
+execute(task)
+```
+
+优点：
+
+- 结构简单、实现容易、任务负载自动均衡
+
+缺点：
+
+```
+锁竞争严重
+CPU cache locality 差
+扩展性有限
+```
+
+当 CPU 数量多时：
+
+```
+多个线程争用同一队列锁
+```
+
+性能会下降。
+
+------
+
+**二、Linux Workqueue 的队列模型**
+
+Linux 为了 **SMP 扩展性**，基本不使用单一共享队列，而是 **per-CPU 队列**。结构：
+
+```
+             workqueue
+                │
+      ┌─────────┼─────────┐
+      ▼         ▼         ▼
+   CPU0 queue CPU1 queue CPU2 queue
+      │         │         │
+   kworker0  kworker1  kworker2
+```
+
+执行流程：
+
+```
+queue_work()
+     │
+     ▼
+per-CPU worklist
+     │
+     ▼
+kworker thread
+     │
+     ▼
+execute
+```
+
+特点：
+
+```
+每个CPU自己的任务队列
+减少锁竞争
+提高cache命中
+```
+
+------
+
+**三、Linux 也有“共享队列”**
+
+虽然 Linux 默认是 per-CPU 队列，但也支持 **共享 worker pool**。例如：
+
+```
+WQ_UNBOUND workqueue
+```
+
+结构：
+
+```
+           global worker pool
+                 │
+         +-------+-------+
+         |       |       |
+       worker  worker  worker
+                 │
+            shared worklist
+```
+
+这种模式和 DDL3 **比较类似**：
+
+```
+共享线程池
+共享任务队列
+```
+
+但是 Linux 仍然做了优化：
+
+- worker 自动扩展、NUMA 优化、调度器控制 CPU 亲和性
+
+------
+
+**四、锁竞争对比**
+
+**DDL3 共享队列**
+
+```
+enqueue → lock(queue)
+dequeue → lock(queue)
+```
+
+多个线程：
+
+```
+Thread1 ┐
+Thread2 ├─竞争 queue lock
+Thread3 ┘
+```
+
+------
+
+**Linux per-CPU 队列**
+
+```
+CPU0 → queue0
+CPU1 → queue1
+CPU2 → queue2
+```
+
+基本没有竞争：
+
+```
+CPU0 worker → queue0
+CPU1 worker → queue1
+```
+
+优势：
+
+```
+锁竞争极低
+cache locality好
+SMP扩展好
+```
+
+------
+
+**五、架构思想差异（本质）**
+
+DDL3：
+
+```
+shared queue
+   │
+thread pool
+```
+
+Linux：
+
+```
+per-CPU queue
+     │
+per-CPU worker
+```
+
+设计理念：
+
+| 系统  | 设计目标   |
+| ----- | ---------- |
+| DDL3  | 简单线程池 |
+| Linux | SMP 可扩展 |
+
+------
+
+**六、什么时候需要共享队列**
+
+Linux 仍然保留共享队列模式，因为有些场景适合：
+
+```
+长时间任务
+CPU不敏感任务
+IO处理
+```
+
+例如：
+
+```
+system_unbound_wq
+```
+
+不绑定 CPU。
+
+------
+
+**七、总结**
+
+| 特性     | DDL3 共享队列 | Linux Workqueue  |
+| -------- | ------------- | ---------------- |
+| 队列     | 单共享队列    | per-CPU 队列     |
+| 锁竞争   | 高            | 低               |
+| CPU扩展  | 一般          | 很好             |
+| 线程管理 | 线程池        | kworker线程池    |
+| 共享模式 | 默认          | 可选(WQ_UNBOUND) |
+
+一句话总结：
+
+```
+DDL3 = 共享队列 + 线程池
+Linux = per-CPU队列 + worker pool
+```
+
+
+
+# END
+
 
